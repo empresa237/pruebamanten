@@ -1304,13 +1304,15 @@ function closeModal(e) {
 function exportExcel() {
   if (!MACHINES.length) { alert('No hay datos cargados aún.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
   const toRow = m => {
+    const f = calcFaltan(m);
+    const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', criticosStr, m.razon||'—', ''];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
   };
 
   const panne = MACHINES.filter(m =>
@@ -1340,7 +1342,8 @@ function exportExcel() {
     ri++;
     for (let i=0;i<panne.length;i++,ri++) {
       const a5=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a5]) ws[a5].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}},font:{bold:true}};
-      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
+      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFDCE6F1'}},font:{bold:true,color:{rgb:'FF1a3a5c'}}};
+      const a7=XLSX.utils.encode_cell({r:ri,c:7}); if(ws[a7] && String(ws[a7].v||'')!=='—') ws[a7].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
     }
     if (proximos.length) ri += 4;
   }
@@ -1349,7 +1352,8 @@ function exportExcel() {
     ri++;
     for (let i=0;i<proximos.length;i++,ri++) {
       const a5=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a5]) ws[a5].s={fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}},font:{bold:true}};
-      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
+      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFDCE6F1'}},font:{bold:true,color:{rgb:'FF1a3a5c'}}};
+      const a7=XLSX.utils.encode_cell({r:ri,c:7}); if(ws[a7] && String(ws[a7].v||'')!=='—') ws[a7].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
     }
   }
 
@@ -1488,13 +1492,15 @@ function exportMonth(year, month, evt) {
   evt && evt.stopPropagation();
   if (!MACHINES.length) { alert('No hay datos cargados.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
   const toRow = m => {
+    const f = calcFaltan(m);
+    const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', criticosStr, m.razon||'—', ''];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
   };
 
   // Todas las máquinas cuyo punto estimado cae en este mes
@@ -1510,7 +1516,7 @@ function exportMonth(year, month, evt) {
   const allRows = [HDR, ...enMes.map(toRow)];
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(allRows);
-  ws['!cols'] = HDR.map((_,ci) => ({wch: Math.min(40, Math.max(10,
+  ws['!cols'] = HDR.map((_,ci) => ({wch: Math.min(40, Math.max(12,
     ...allRows.map(r => String(r[ci]||'').length)))}));
 
   // Header verde Harcha
@@ -1519,7 +1525,7 @@ function exportMonth(year, month, evt) {
     if (ws[a]) ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
   });
 
-  // Color en columna HR O KM FALTANTE según valor + Otros Críticos
+  // Color en columna HR O KM FALTANTE según valor + Fecha + Otros Críticos
   for (let r = 1; r < allRows.length; r++) {
     const v = parseFloat(allRows[r][5]);
     const isKm = /km/i.test(String(allRows[r][4]||''));
@@ -1528,10 +1534,15 @@ function exportMonth(year, month, evt) {
       if (v < 0)                                      ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}}, font:{bold:true} };
       else if ((isKm && v<=1600)||(!isKm && v<=160))  ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}}, font:{bold:true} };
     }
-    // Otros Críticos col 6: rojo claro si tiene contenido
+    // Fecha estimada col 6: azul claro
     const a6 = XLSX.utils.encode_cell({r, c:6});
-    if (ws[a6] && String(ws[a6].v||'') !== '—' && String(ws[a6].v||'').trim() !== '') {
-      ws[a6].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}}, font:{bold:true} };
+    if (ws[a6] && String(ws[a6].v||'') !== '—') {
+      ws[a6].s = { fill:{patternType:'solid',fgColor:{rgb:'FFDCE6F1'}}, font:{bold:true, color:{rgb:'FF1a3a5c'}} };
+    }
+    // Otros Críticos col 7: rojo claro si tiene contenido
+    const a7 = XLSX.utils.encode_cell({r, c:7});
+    if (ws[a7] && String(ws[a7].v||'') !== '—' && String(ws[a7].v||'').trim() !== '') {
+      ws[a7].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}}, font:{bold:true} };
     }
   }
 
