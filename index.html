@@ -555,36 +555,81 @@ function buildRateLookup(wb) {
 // ═══════════════════════════════════════════════════
 function parsePautas(wb) {
   const pautas = [];
-  // 1. Parse INDICE → mapping tipo/marca/modelo → sheet
+  const CODE_PAT = /^[A-Z]{1,6}-?\d{1,3}$/i;
+
+  // 1. Parse INDICE → mapping sheet → tipo/marca/modelo
   const wsIdx = wb.Sheets['INDICE'];
-  if (!wsIdx) return pautas;
-  const idxRows = XLSX.utils.sheet_to_json(wsIdx, {header:1, defval:null});
-  const indice = [];
-  for (let i = 0; i < idxRows.length; i++) {
-    const r = idxRows[i];
-    if (!r) continue;
-    const tipo = r[1] ? String(r[1]).trim() : '';
-    const marca = r[2] ? String(r[2]).trim() : '';
-    const modelo = r[3] ? String(r[3]).trim() : '';
-    let sn = r[4] != null ? String(r[4]).replace(',','.').trim() : '';
-    if (!tipo || !sn || /^TIPO$/i.test(tipo) || /^INDICE$/i.test(sn)) continue;
-    indice.push({tipo, marca, modelo, sn});
+  const sheetMeta = {}; // { sheetName: {tipo, marca, modelo} }
+  if (wsIdx) {
+    const idxRows = XLSX.utils.sheet_to_json(wsIdx, {header:1, defval:null});
+    for (let i = 0; i < idxRows.length; i++) {
+      const r = idxRows[i]; if (!r) continue;
+      const tipo = r[1] ? String(r[1]).trim() : '';
+      const marca = r[2] ? String(r[2]).trim() : '';
+      const modelo = r[3] ? String(r[3]).trim() : '';
+      let sn = r[4] != null ? String(r[4]).replace(',','.').trim() : '';
+      if (!tipo || !sn || /^TIPO$/i.test(tipo) || /^INDICE$/i.test(sn)) continue;
+      sheetMeta[sn] = {tipo, marca, modelo};
+    }
   }
 
-  // 2. Parse each pauta sheet
-  const processed = new Set();
-  for (const entry of indice) {
-    if (processed.has(entry.sn)) continue;
-    const ws = wb.Sheets[entry.sn];
+  // 2. Procesar TODAS las hojas (excepto INDICE)
+  for (const sheetName of wb.SheetNames) {
+    if (sheetName === 'INDICE') continue;
+    const ws = wb.Sheets[sheetName];
     if (!ws) continue;
-    processed.add(entry.sn);
-    const p = _parsePautaSheet(wb, entry.sn);
+
+    // Parsear datos de la pauta (filtros, lubricantes, actividades)
+    const p = _parsePautaSheet(wb, sheetName);
     if (!p) continue;
-    p.indiceTipo = entry.tipo;
-    p.indiceMarca = entry.marca;
-    p.indiceModelo = entry.modelo;
-    pautas.push(p);
+
+    // Buscar metadata del INDICE (exact match o por prefijo: 2.12.1 → 2.12)
+    let meta = sheetMeta[sheetName];
+    if (!meta) {
+      const prefix = sheetName.replace(/\.\d+$/, '');
+      meta = sheetMeta[prefix];
+    }
+
+    // Escanear TODOS los códigos de máquina en las primeras 15 filas
+    const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+    const foundCodes = new Set();
+    for (let i = 0; i < Math.min(15, rows.length); i++) {
+      const r = rows[i]; if (!r) continue;
+      for (let c = 0; c < Math.min(r.length, 30); c++) {
+        const v = r[c];
+        if (!v || typeof v !== 'string') continue;
+        const s = v.trim();
+        // Debe tener guión y ser código tipo XX-NN (no patentes largas)
+        if (s.length <= 8 && s.includes('-') && CODE_PAT.test(s)) {
+          foundCodes.add(s.toUpperCase());
+        }
+      }
+    }
+
+    const basePauta = {
+      sheetName,
+      filtros: p.filtros,
+      lubricantes: p.lubricantes,
+      actividades: p.actividades,
+      modelo: p.modelo,
+      marca: p.marca,
+      indiceTipo: meta ? meta.tipo : '',
+      indiceMarca: meta ? meta.marca : p.marca,
+      indiceModelo: meta ? meta.modelo : p.modelo,
+    };
+
+    // Crear una entrada por cada código encontrado
+    if (foundCodes.size > 0) {
+      for (const code of foundCodes) {
+        pautas.push({ ...basePauta, machineCode: code });
+      }
+    } else {
+      // Sin códigos → entrada genérica por tipo/marca
+      pautas.push({ ...basePauta, machineCode: '' });
+    }
   }
+
+  console.log(`[Pautas] Sheets procesados: ${wb.SheetNames.length-1}, entradas creadas: ${pautas.length}`);
   return pautas;
 }
 
@@ -632,25 +677,34 @@ function _parsePautaSheet(wb, sheetName) {
       // Buscar sección FILTROS
       if (filtrosStart < 0 && /^FILTROS$/i.test(s)) {
         filtrosStart = i;
-        // Mapear columnas del header de filtros
-        for (let hc = 0; hc < Math.min(r.length, 20); hc++) {
-          const h = String(r[hc]||'').trim().toUpperCase();
-          if (/^CANT/i.test(h)) filtrosHeaderCols.cant = hc;
-          if (/ORIGINAL|N°.*FILTRO/i.test(h)) filtrosHeaderCols.original = hc;
-          if (/DONAL/i.test(h)) filtrosHeaderCols.donaldson = hc;
-          if (/FLEET/i.test(h)) filtrosHeaderCols.fleetguard = hc;
-          if (/BALW|BALDW/i.test(h)) filtrosHeaderCols.baldwin = hc;
+        // Mapear columnas del header de filtros (puede estar en esta fila o la siguiente)
+        const scanRows = [rows[i]];
+        if (i+1 < rows.length && rows[i+1]) scanRows.push(rows[i+1]);
+        for (const scanR of scanRows) {
+          for (let hc = 0; hc < Math.min(scanR.length, 20); hc++) {
+            const h = String(scanR[hc]||'').trim().toUpperCase();
+            if (/^CANT/i.test(h) && filtrosHeaderCols.cant === undefined) filtrosHeaderCols.cant = hc;
+            if (/ORIGINAL|N°.*FILTRO.*ORIG/i.test(h) && filtrosHeaderCols.original === undefined) filtrosHeaderCols.original = hc;
+            if (/ALTERNATIV|N°.*FILTRO.*ALT/i.test(h) && filtrosHeaderCols.alternativo === undefined) filtrosHeaderCols.alternativo = hc;
+            if (/DONAL/i.test(h) && filtrosHeaderCols.donaldson === undefined) filtrosHeaderCols.donaldson = hc;
+            if (/FLEET/i.test(h) && filtrosHeaderCols.fleetguard === undefined) filtrosHeaderCols.fleetguard = hc;
+            if (/BALW|BALDW/i.test(h) && filtrosHeaderCols.baldwin === undefined) filtrosHeaderCols.baldwin = hc;
+          }
         }
       }
 
       // Buscar sección LUBRICANTES
       if (lubStart < 0 && /^LUBRICANT/i.test(s)) {
         lubStart = i;
-        for (let hc = 0; hc < Math.min(r.length, 20); hc++) {
-          const h = String(r[hc]||'').trim().toUpperCase();
-          if (/^CANT/i.test(h)) lubHeaderCols.cant = hc;
-          if (/ESPECIF.*ORIGINAL|ESPECIF.*ORIGIN/i.test(h)) lubHeaderCols.espec = hc;
-          if (/ALTERNATIV/i.test(h)) lubHeaderCols.alt = hc;
+        const scanRows = [rows[i]];
+        if (i+1 < rows.length && rows[i+1]) scanRows.push(rows[i+1]);
+        for (const scanR of scanRows) {
+          for (let hc = 0; hc < Math.min(scanR.length, 20); hc++) {
+            const h = String(scanR[hc]||'').trim().toUpperCase();
+            if (/^CANT/i.test(h) && lubHeaderCols.cant === undefined) lubHeaderCols.cant = hc;
+            if (/ESPECIF.*ORIGINAL|ESPECIF.*ORIGIN/i.test(h) && lubHeaderCols.espec === undefined) lubHeaderCols.espec = hc;
+            if (/ALTERNATIV/i.test(h) && lubHeaderCols.alt === undefined) lubHeaderCols.alt = hc;
+          }
         }
       }
 
@@ -682,7 +736,7 @@ function _parsePautaSheet(wb, sheetName) {
       // Buscar el nombre del filtro en las primeras columnas
       let n = '';
       for (let c = Math.max(0, nameCol-1); c <= Math.min(nameCol+2, r.length-1); c++) {
-        if (r[c] && String(r[c]).trim().length > 4 && /FILTRO|DECANT|ELEMENT|PRE.?FILT/i.test(String(r[c]))) {
+        if (r[c] && String(r[c]).trim().length > 4 && /FILTRO|DECANT|ELEMENT|PRE.?FILT|SECADO|RESPIRAD|PILOTA|CONJUNT|TANQUE/i.test(String(r[c]))) {
           n = String(r[c]).trim(); nameCol = c; break;
         }
       }
@@ -706,7 +760,7 @@ function _parsePautaSheet(wb, sheetName) {
       const r = rows[i]; if (!r) continue;
       let n = '';
       for (let c = Math.max(0, nameCol-1); c <= Math.min(nameCol+2, r.length-1); c++) {
-        if (r[c] && String(r[c]).trim().length > 4 && /ACEITE|REFRIG|ANTICON|COMBUST|GRASA|EJES|EST\./i.test(String(r[c]))) {
+        if (r[c] && String(r[c]).trim().length > 3 && /ACEITE|REFRIG|ANTICON|COMBUST|GRASA|EJES|EST\.|CUBOS|MANDOS|UREA|TRANSMI/i.test(String(r[c]))) {
           n = String(r[c]).trim(); nameCol = c; break;
         }
       }
@@ -727,7 +781,7 @@ function _parsePautaSheet(wb, sheetName) {
       // Buscar nombre de actividad
       let n = '';
       for (let c = 0; c < Math.min(r.length, 8); c++) {
-        if (r[c] && typeof r[c] === 'string' && r[c].trim().length > 3 && /CAMBIO|REVISION|ENGRASE|CHEQUEO|REVISAR|LIMPIEZA|CAMBIAR/i.test(r[c])) {
+        if (r[c] && typeof r[c] === 'string' && r[c].trim().length > 3 && /CAMBIO|REVISION|ENGRASE|CHEQUEO|REVISAR|LIMPIEZA|CAMBIAR|FILTRO|LAVADO/i.test(r[c])) {
           n = r[c].trim(); break;
         }
       }
@@ -748,6 +802,15 @@ function _normTipo(t) { return (t||'').toUpperCase().replace(/[\s\-_]+/g,' ').re
 // Buscar pauta que mejor coincida con una máquina
 function matchPauta(m) {
   if (!PAUTAS_DB.length) return null;
+  const mCod = (m.cod||'').trim().toUpperCase();
+
+  // 1. Match directo por código de máquina (siempre gana)
+  if (mCod) {
+    const directMatch = PAUTAS_DB.find(p => p.machineCode && p.machineCode === mCod);
+    if (directMatch) return directMatch;
+  }
+
+  // 2. Fallback: match por tipo + marca + modelo
   const mTipo = _normTipo(m.tipo || m.sheetTipo || m.familia);
   const mMarca = _normTipo(m.marca);
   const mModelo = _normTipo(m.modelo);
@@ -762,7 +825,7 @@ function matchPauta(m) {
     // Match tipo (required)
     if (mTipo.includes(pTipo) || pTipo.includes(mTipo)) score += 10;
     else if (mTipo.split(' ').some(w => w.length>3 && pTipo.includes(w))) score += 5;
-    else continue; // no tipo match → skip
+    else continue;
 
     // Match marca
     if (mMarca && pMarca) {
@@ -776,9 +839,6 @@ function matchPauta(m) {
       const pMods = pModelo.split(/[\s\-\/]+/);
       if (pMods.some(pm => pm.length>2 && mModelo.includes(pm))) score += 6;
     }
-
-    // Match machine code directly
-    if (p.machineCode && m.cod && _normTipo(p.machineCode) === _normTipo(m.cod)) score += 20;
 
     if (score > bestScore) { bestScore = score; best = p; }
   }
