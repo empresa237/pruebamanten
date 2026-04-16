@@ -188,6 +188,27 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
 .error-icon{font-size:48px;}
 .error-title{font-size:16px;font-weight:700;color:#cc0000;}
 .error-msg{font-size:12px;color:#666;max-width:400px;line-height:1.5;}
+
+/* KIT MANTENCIÓN */
+.kit-toggle{display:flex;align-items:center;gap:6px;padding:8px 12px;background:#f0f7f0;border:1px solid #c6efce;border-radius:4px;cursor:pointer;font-size:11px;font-weight:700;color:#1F7145;transition:background .15s;margin-top:8px;user-select:none;}
+.kit-toggle:hover{background:#dce6f1;}
+.kit-toggle .kit-arrow{transition:transform .2s;font-size:9px;}
+.kit-toggle.open .kit-arrow{transform:rotate(90deg);}
+.kit-body{display:none;margin-top:6px;border:1px solid #e8e8e8;border-radius:4px;overflow:hidden;}
+.kit-body.show{display:block;}
+.kit-tab-bar{display:flex;border-bottom:2px solid #1F7145;background:#f7f7f7;}
+.kit-tab{padding:5px 12px;font-size:10px;font-weight:700;cursor:pointer;border:none;background:transparent;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px;font-family:Calibri,sans-serif;}
+.kit-tab.active{color:#1F7145;border-bottom-color:#1F7145;background:#fff;}
+.kit-tab:hover:not(.active){background:#eee;}
+.kit-panel{display:none;padding:8px 10px;max-height:220px;overflow-y:auto;font-size:10px;}
+.kit-panel.show{display:block;}
+.kit-panel table{width:100%;border-collapse:collapse;font-size:10px;}
+.kit-panel th{background:#dce6f1;padding:3px 6px;text-align:left;font-weight:700;font-size:9px;text-transform:uppercase;color:#555;border-bottom:1px solid #bfbfbf;position:sticky;top:0;}
+.kit-panel td{padding:3px 6px;border-bottom:1px solid #f0f0f0;}
+.kit-panel tr:hover td{background:#f5f5f5;}
+.kit-act-item{padding:2px 0;display:flex;align-items:center;gap:4px;}
+.kit-act-item::before{content:'✓';color:#1F7145;font-weight:700;font-size:9px;}
+.kit-empty{color:#aaa;font-style:italic;padding:12px;text-align:center;}
 </style>
 </head>
 <body>
@@ -321,6 +342,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
 const CONFIG = {
   FILE_MANTENCION: 'mantenciones_pendientes_y_futuras.xlsx',
   FILE_MAQUINAS:   'DB2_HARCHA_MAQUINAS.xlsx',
+  FILE_PAUTAS:     'Pautas_de_mantención__NUEVAS_2024_2025.xlsx',
   AUTO_RELOAD_MIN: 5,
   WARN_DAYS: 30,
   // Promedios diarios calculados desde reportes reales (últimos 90 días)
@@ -382,6 +404,8 @@ let DB_MAQUINAS = [];
 let RATE_LOOKUP = {}; // { 'C-02': { last_report: '...', last_fuel: '...' } }
 let _db2Loaded = false;
 let _sortByUrgency = false;
+let PAUTAS_DB = [];  // [{tipo,marca,modelo,sheetName,filtros,lubricantes,actividades}]
+let _pautasLoaded = false;
 let ganttStartDate = null;
 let DAY_W = 22;
 let TOTAL_DAYS = 365;
@@ -524,6 +548,179 @@ function buildRateLookup(wb) {
   }
 
   return lookup;
+}
+
+// ═══════════════════════════════════════════════════
+// PARSER: Pautas de Mantención
+// ═══════════════════════════════════════════════════
+function parsePautas(wb) {
+  const pautas = [];
+  // 1. Parse INDICE → mapping tipo/marca/modelo → sheet
+  const wsIdx = wb.Sheets['INDICE'];
+  if (!wsIdx) return pautas;
+  const idxRows = XLSX.utils.sheet_to_json(wsIdx, {header:1, defval:null});
+  const indice = [];
+  for (let i = 7; i < idxRows.length; i++) {
+    const r = idxRows[i];
+    if (!r) continue;
+    const tipo = r[1] ? String(r[1]).trim() : '';
+    const marca = r[2] ? String(r[2]).trim() : '';
+    const modelo = r[3] ? String(r[3]).trim() : '';
+    let sn = r[4] != null ? String(r[4]).replace(',','.').trim() : '';
+    if (!tipo || !sn) continue;
+    indice.push({tipo, marca, modelo, sn});
+  }
+
+  // 2. Parse each pauta sheet
+  const processed = new Set();
+  for (const entry of indice) {
+    if (processed.has(entry.sn)) continue;
+    const ws = wb.Sheets[entry.sn];
+    if (!ws) continue;
+    processed.add(entry.sn);
+    const p = _parsePautaSheet(wb, entry.sn);
+    if (!p) continue;
+    p.indiceTipo = entry.tipo;
+    p.indiceMarca = entry.marca;
+    p.indiceModelo = entry.modelo;
+    pautas.push(p);
+  }
+  return pautas;
+}
+
+function _parsePautaSheet(wb, sheetName) {
+  const ws = wb.Sheets[sheetName];
+  if (!ws) return null;
+  const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+  if (rows.length < 12) return null;
+
+  const modelo = rows[7] && rows[7][3] ? String(rows[7][3]).trim() : '';
+  const machineCode = rows[7] && rows[7][7] ? String(rows[7][7]).trim() : '';
+  const marca = rows[8] && rows[8][3] ? String(rows[8][3]).trim() : '';
+
+  // Find section start rows
+  let filtrosStart = -1, lubStart = -1, actStart = -1;
+  for (let i = 10; i < rows.length; i++) {
+    const r = rows[i]; if (!r) continue;
+    const v = r[2] ? String(r[2]).toUpperCase().trim() : '';
+    if (filtrosStart<0 && (v==='FILTROS' || v.match(/^FILTROS\b/))) filtrosStart = i;
+    if (lubStart<0 && v.match(/^LUBRICANT/)) lubStart = i;
+    if (actStart<0 && v.match(/^ACTIVIDAD/)) actStart = i;
+  }
+
+  // Parse FILTROS
+  const filtros = [];
+  if (filtrosStart >= 0) {
+    const end = lubStart > filtrosStart ? lubStart : (actStart > filtrosStart ? actStart : Math.min(filtrosStart+20, rows.length));
+    for (let i = filtrosStart+1; i < end; i++) {
+      const r = rows[i]; if (!r) continue;
+      const n = r[2] ? String(r[2]).trim() : '';
+      if (!n || n.length<4 || /^LUBRICANT|^ACTIVIDAD/i.test(n)) break;
+      const cant = r[3] != null ? String(r[3]).trim() : '';
+      const orig = r[4] != null ? String(r[4]).trim() : '';
+      const don = r[6] != null ? String(r[6]).trim() : '';
+      const fleet = r[8] != null ? String(r[8]).trim() : '';
+      if (cant || orig || don || fleet) filtros.push({nombre:n, cantidad:cant, original:orig, donaldson:don, fleetguard:fleet});
+    }
+  }
+
+  // Parse LUBRICANTES
+  const lubricantes = [];
+  if (lubStart >= 0) {
+    const end = actStart > lubStart ? actStart : Math.min(lubStart+15, rows.length);
+    for (let i = lubStart+1; i < end; i++) {
+      const r = rows[i]; if (!r) continue;
+      const n = r[2] ? String(r[2]).trim() : '';
+      if (!n || n.length<4 || /^ACTIVIDAD|^NOTA/i.test(n)) break;
+      const cant = r[3] != null ? String(r[3]).trim() : '';
+      const espec = r[4] != null ? String(r[4]).trim() : '';
+      const alt = r[7] != null ? String(r[7]).trim() : '';
+      if (cant || espec) lubricantes.push({nombre:n, cantidad:cant, especificacion:espec, alternativa:alt});
+    }
+  }
+
+  // Parse ACTIVIDADES
+  const actividades = {intervalos:[], items:[]};
+  if (actStart >= 0) {
+    const hdr = rows[actStart];
+    if (hdr) {
+      for (let c = 3; c < Math.min((hdr.length||0), 20); c++) {
+        if (!hdr[c]) continue;
+        const raw = String(hdr[c]).replace(/\s*HRS?\s*/gi,'').replace(/[^\d.]/g,'').trim();
+        const num = parseFloat(raw);
+        if (!isNaN(num) && num > 0) actividades.intervalos.push({col:c, valor:num});
+      }
+    }
+    for (let i = actStart+1; i < Math.min(actStart+30, rows.length); i++) {
+      const r = rows[i]; if (!r) continue;
+      const n = r[2] ? String(r[2]).trim() : '';
+      if (!n || n.length<4 || /CANTIDAD DE FILTROS|^NOTA/i.test(n)) break;
+      const marcas = actividades.intervalos.map(iv => {
+        const v = r[iv.col]; return v && String(v).toUpperCase().trim() === 'X';
+      });
+      if (marcas.some(Boolean)) actividades.items.push({nombre:n, marcas});
+    }
+  }
+
+  return {sheetName, modelo, marca, machineCode, filtros, lubricantes, actividades};
+}
+
+// Normalizar texto para matching
+function _normTipo(t) { return (t||'').toUpperCase().replace(/[\s\-_]+/g,' ').replace(/\s+/g,' ').trim(); }
+
+// Buscar pauta que mejor coincida con una máquina
+function matchPauta(m) {
+  if (!PAUTAS_DB.length) return null;
+  const mTipo = _normTipo(m.tipo || m.sheetTipo || m.familia);
+  const mMarca = _normTipo(m.marca);
+  const mModelo = _normTipo(m.modelo);
+
+  let best = null, bestScore = 0;
+  for (const p of PAUTAS_DB) {
+    let score = 0;
+    const pTipo = _normTipo(p.indiceTipo);
+    const pMarca = _normTipo(p.indiceMarca || p.marca);
+    const pModelo = _normTipo(p.indiceModelo || p.modelo);
+
+    // Match tipo (required)
+    if (mTipo.includes(pTipo) || pTipo.includes(mTipo)) score += 10;
+    else if (mTipo.split(' ').some(w => w.length>3 && pTipo.includes(w))) score += 5;
+    else continue; // no tipo match → skip
+
+    // Match marca
+    if (mMarca && pMarca) {
+      const pMarcas = pMarca.split(/[\s\-\/]+/);
+      if (pMarcas.some(pm => pm.length>2 && mMarca.includes(pm))) score += 8;
+      else if (mMarca.split(' ').some(w => w.length>3 && pMarca.includes(w))) score += 4;
+    }
+
+    // Match modelo
+    if (mModelo && pModelo) {
+      const pMods = pModelo.split(/[\s\-\/]+/);
+      if (pMods.some(pm => pm.length>2 && mModelo.includes(pm))) score += 6;
+    }
+
+    // Match machine code directly
+    if (p.machineCode && m.cod && _normTipo(p.machineCode) === _normTipo(m.cod)) score += 20;
+
+    if (score > bestScore) { bestScore = score; best = p; }
+  }
+  return best;
+}
+
+// Determinar qué actividades aplican según el próximo KM/HR
+function getKitActividades(pauta, proximoVal) {
+  if (!pauta || !pauta.actividades || !pauta.actividades.intervalos.length) return [];
+  const ivs = pauta.actividades.intervalos.map(iv => iv.valor);
+  const applies = ivs.map(iv => {
+    if (!proximoVal || proximoVal <= 0) return true; // si no hay dato, mostrar todo
+    return Math.abs(proximoVal % iv) < 1; // proximo es múltiplo de este intervalo
+  });
+  // Si ninguno aplica, usar el intervalo base (el menor)
+  if (!applies.some(Boolean)) applies[0] = true;
+  return pauta.actividades.items.filter(act =>
+    act.marcas.some((mk, i) => mk && applies[i])
+  ).map(a => a.nombre);
 }
 
 // ═══════════════════════════════════════════════════
@@ -977,9 +1174,16 @@ function renderRows(list) {
       criticosHtml = `<span class="lr-fuel-alarm" title="⚠ Otros componentes vencidos:\n${lista}" style="color:#e65100">⚙</span>`;
     }
 
+    // Indicador pauta de mantención
+    let pautaHtml = '';
+    if (_pautasLoaded && !isDisc) {
+      const hasPauta = matchPauta(m);
+      if (!hasPauta) pautaHtml = `<span class="lr-fuel-alarm" title="⚠ Sin pauta de mantención asociada — verificar insumos" style="color:#cc0000;font-size:8px">❓</span>`;
+    }
+
     labHtml += `<div class="lr ${evenCls} ${bajaCls}" data-idx="${i}" onmouseenter="hlRow(${i},true)" onmouseleave="hlRow(${i},false)" onclick="openMdet(${i}, event)">
       <div class="lr-rn" style="width:24px">${i+1}</div>
-      <div class="lr-cod" style="width:80px;color:${codColor}">${stateIco}${m.cod}${alarmHtml}${fuelAlarmHtml}${criticosHtml}</div>
+      <div class="lr-cod" style="width:80px;color:${codColor}">${stateIco}${m.cod}${alarmHtml}${fuelAlarmHtml}${criticosHtml}${pautaHtml}</div>
       <div class="lr-tipo" style="width:160px" title="${m.tipo} ${m.marca}">${m.tipo}${m.marca ? ' · <span style="color:#aaa;font-size:9px">'+m.marca+'</span>' : ''}</div>
       <div class="lr-un" style="width:36px">${m.kmhr||'—'}</div>
       <div class="lr-days ${faltanCls}" style="width:64px">${faltanStr}</div>
@@ -1290,12 +1494,66 @@ function openMdet(idx, e) {
           </div>`;
         }).join('')}
       </div>
-    </div>` : ''}`;
+    </div>` : ''}
+    ${_pautasLoaded ? (() => {
+      const pauta = matchPauta(m);
+      if (!pauta) return '<div class="modal-section"><div class="kit-empty">Sin pauta de mantención asociada para este tipo/marca</div></div>';
+      // Calcular próximo valor para determinar intervalo
+      const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+      const actList = getKitActividades(pauta, proximoVal);
+      const kitId = 'kit-' + m.cod.replace(/[^a-zA-Z0-9]/g,'');
+      return `
+    <div class="modal-section">
+      <div class="kit-toggle" onclick="toggleKit('${kitId}',this)">
+        <span class="kit-arrow">▶</span> 🔧 Kit de Mantención
+        <span style="font-weight:400;color:#888;margin-left:auto;font-size:9px">Pauta: ${pauta.indiceTipo} · ${pauta.indiceMarca||pauta.marca}</span>
+      </div>
+      <div class="kit-body" id="${kitId}">
+        <div class="kit-tab-bar">
+          <button class="kit-tab active" onclick="switchKitTab('${kitId}','filtros',this)">Filtros (${pauta.filtros.length})</button>
+          <button class="kit-tab" onclick="switchKitTab('${kitId}','lub',this)">Lubricantes (${pauta.lubricantes.length})</button>
+          <button class="kit-tab" onclick="switchKitTab('${kitId}','act',this)">Actividades (${actList.length})</button>
+        </div>
+        <div class="kit-panel show" id="${kitId}-filtros">
+          ${pauta.filtros.length ? `<table>
+            <thead><tr><th>Filtro</th><th>Cant.</th><th>Original</th><th>Donaldson</th><th>Fleetguard</th></tr></thead>
+            <tbody>${pauta.filtros.map(f=>`<tr><td>${f.nombre}</td><td style="text-align:center">${f.cantidad}</td><td><b>${f.original||'—'}</b></td><td>${f.donaldson||'—'}</td><td>${f.fleetguard||'—'}</td></tr>`).join('')}</tbody>
+          </table>` : '<div class="kit-empty">Sin datos de filtros</div>'}
+        </div>
+        <div class="kit-panel" id="${kitId}-lub">
+          ${pauta.lubricantes.length ? `<table>
+            <thead><tr><th>Lubricante</th><th>Cant.</th><th>Especificación</th><th>Alternativa</th></tr></thead>
+            <tbody>${pauta.lubricantes.map(l=>`<tr><td>${l.nombre}</td><td style="text-align:center"><b>${l.cantidad}</b></td><td>${l.especificacion||'—'}</td><td>${l.alternativa||'—'}</td></tr>`).join('')}</tbody>
+          </table>` : '<div class="kit-empty">Sin datos de lubricantes</div>'}
+        </div>
+        <div class="kit-panel" id="${kitId}-act">
+          ${actList.length ? actList.map(a=>`<div class="kit-act-item">${a}</div>`).join('') : '<div class="kit-empty">Sin actividades detectadas para este intervalo</div>'}
+          ${proximoVal ? `<div style="margin-top:6px;padding-top:4px;border-top:1px solid #e8e8e8;font-size:9px;color:#888">Intervalo calculado para próximo: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''}</div>` : ''}
+        </div>
+      </div>
+    </div>`;
+    })() : ''}`;
   document.getElementById('modal-overlay').classList.add('show');
 }
 function closeModal(e) {
   if (e && e.target !== document.getElementById('modal-overlay')) return;
   document.getElementById('modal-overlay').classList.remove('show');
+}
+function toggleKit(id, el) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  body.classList.toggle('show');
+  el.classList.toggle('open');
+}
+function switchKitTab(kitId, tab, btn) {
+  // Hide all panels, show selected
+  ['filtros','lub','act'].forEach(t => {
+    const p = document.getElementById(kitId+'-'+t);
+    if (p) p.classList.toggle('show', t===tab);
+  });
+  // Update active tab
+  btn.parentElement.querySelectorAll('.kit-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
 }
 
 // ═══════════════════════════════════════════════════
@@ -1358,6 +1616,46 @@ function exportExcel() {
   }
 
   XLSX.utils.book_append_sheet(wb, ws, 'Mantención');
+
+  // Hoja 2: INSUMOS
+  if (_pautasLoaded) {
+    const allMachines = [...panne, ...proximos];
+    const insRows = [['INSUMOS DE MANTENCIÓN — ' + today.toLocaleDateString('es-CL')],[]];
+    allMachines.forEach(m => {
+      const pauta = matchPauta(m);
+      if (!pauta) {
+        insRows.push([m.cod, m.tipo||'', m.marca||'', '⚠ SIN PAUTA ASOCIADA']);
+        insRows.push([]);
+        return;
+      }
+      const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+      const actList = getKitActividades(pauta, proximoVal);
+      insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} ▬▬`]);
+      if (pauta.filtros.length) {
+        insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
+        pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
+      }
+      if (pauta.lubricantes.length) {
+        insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
+        pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
+      }
+      if (actList.length) {
+        insRows.push(['','ACTIVIDADES' + (proximoVal ? ` (próx: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
+        actList.forEach(a => insRows.push(['', '✓ ' + a]));
+      }
+      insRows.push([]);
+    });
+    const wsIns = XLSX.utils.aoa_to_sheet(insRows);
+    wsIns['!cols'] = [{wch:4},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16}];
+    for (let r = 0; r < insRows.length; r++) {
+      if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
+        const a = XLSX.utils.encode_cell({r, c:0});
+        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
+      }
+    }
+    XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
+  }
+
   const fecha = today.toISOString().slice(0,10);
   XLSX.writeFile(wb, `control_mantencion_${fecha}.xlsx`, {cellStyles:true});
 }
@@ -1433,6 +1731,17 @@ async function loadData() {
     const maintList = parseMantencion(wbMaint);
     setLoading(80, 'Cruzando información...');
     MACHINES = mergeMachines(DB_MAQUINAS, maintList);
+    // Cargar Pautas de Mantención (opcional, no bloquea si falta)
+    try {
+      setLoading(85, 'Cargando pautas de mantención...');
+      const wbPautas = await fetchExcel(CONFIG.FILE_PAUTAS);
+      PAUTAS_DB = parsePautas(wbPautas);
+      _pautasLoaded = PAUTAS_DB.length > 0;
+      console.log(`[Pautas] ${PAUTAS_DB.length} pautas cargadas`);
+    } catch(e) {
+      console.warn('[Pautas] No se pudo cargar:', e.message);
+      _pautasLoaded = false;
+    }
     setLoading(95, 'Renderizando...');
     buildDateRange();
     buildFamilias();
@@ -1458,7 +1767,8 @@ async function loadData() {
     showError(`<b>${err.message}</b><br><br>
       Asegúrate de que los archivos existan en la misma carpeta que <code>index.html</code>:<br>
       📄 <code>${CONFIG.FILE_MANTENCION}</code><br>
-      📄 <code>${CONFIG.FILE_MAQUINAS}</code><br><br>
+      📄 <code>${CONFIG.FILE_MAQUINAS}</code><br>
+      📄 <code>${CONFIG.FILE_PAUTAS}</code> (opcional)<br><br>
       Si el error persiste en GitHub Pages, verifica que los archivos estén commiteados correctamente.`);
   }
 }
@@ -1548,6 +1858,50 @@ function exportMonth(year, month, evt) {
 
   const nomMes = new Date(year, month, 1).toLocaleString('es-CL',{month:'long',year:'numeric'}).replace(/ /g,'_');
   XLSX.utils.book_append_sheet(wb, ws, 'Mantención');
+
+  // Hoja 2: INSUMOS — Kit de mantención por máquina
+  if (_pautasLoaded) {
+    const insRows = [['INSUMOS DE MANTENCIÓN — ' + nomMes.replace(/_/g,' ').toUpperCase()],[]];
+    enMes.forEach(m => {
+      const pauta = matchPauta(m);
+      if (!pauta) {
+        insRows.push([m.cod, m.tipo||'', m.marca||'', '⚠ SIN PAUTA ASOCIADA — verificar insumos manualmente']);
+        insRows.push([]);
+        return;
+      }
+      const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+      const actList = getKitActividades(pauta, proximoVal);
+      insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} — Pauta: ${pauta.indiceTipo} ${pauta.indiceMarca||pauta.marca} ▬▬`]);
+      if (pauta.filtros.length) {
+        insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
+        pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
+      }
+      if (pauta.lubricantes.length) {
+        insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
+        pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
+      }
+      if (actList.length) {
+        insRows.push(['','ACTIVIDADES A REALIZAR' + (proximoVal ? ` (próximo: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
+        actList.forEach(a => insRows.push(['', '✓ ' + a]));
+      }
+      insRows.push([]);
+    });
+    const wsIns = XLSX.utils.aoa_to_sheet(insRows);
+    wsIns['!cols'] = [{wch:4},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16}];
+    // Estilo título de cada máquina (filas con ▬▬)
+    for (let r = 0; r < insRows.length; r++) {
+      if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
+        const a = XLSX.utils.encode_cell({r, c:0});
+        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
+      }
+      if (insRows[r][0] && String(insRows[r][0]).includes('SIN PAUTA')) {
+        const a = XLSX.utils.encode_cell({r, c:3});
+        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFF3CD'}}, font:{bold:true, color:{rgb:'FF856404'}} };
+      }
+    }
+    XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
+  }
+
   XLSX.writeFile(wb, `mantencion_${nomMes}.xlsx`, {cellStyles:true});
 }
 function exportSinReporte() {
