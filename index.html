@@ -904,8 +904,8 @@ function _detectarColumnasFaltan(ws, range) {
   fH.forEach((h, i) => {
     if (!h) return;
     const hUp = String(h).trim().toUpperCase();
-    // 1) Columna con header explícito "FALTAN"
-    if (hUp === 'FALTAN') {
+    // 1) Columna con header explícito "FALTAN" (solo si no fue agregada ya por PROXIMO+1)
+    if (hUp === 'FALTAN' && !colsFSet.has(i)) {
       colsFSet.add(i);
       colsF.push({ idx: i, seccion: _buscarSeccion(fSec, i) });
     }
@@ -1694,20 +1694,39 @@ function switchKitTab(kitId, tab, btn) {
 }
 
 // ═══════════════════════════════════════════════════
+// KIT RESUMEN PARA EXPORTACIÓN
+// ═══════════════════════════════════════════════════
+function getKitResumen(m) {
+  if (!_pautasLoaded) return {filtros:'', lubricantes:'', actividades:'', pauta:''};
+  const pauta = matchPauta(m);
+  if (!pauta) return {filtros:'⚠ SIN PAUTA', lubricantes:'⚠ SIN PAUTA', actividades:'', pauta:'SIN PAUTA'};
+  const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+  const actList = getKitActividades(pauta, proximoVal);
+  return {
+    filtros: pauta.filtros.map(f => `${f.nombre} x${f.cantidad} [${f.original||f.donaldson||'—'}]`).join(' | '),
+    lubricantes: pauta.lubricantes.map(l => `${l.nombre}: ${l.cantidad} ${l.especificacion||''}`).join(' | '),
+    actividades: actList.join(' | '),
+    pauta: `${pauta.indiceTipo||''} ${pauta.indiceMarca||pauta.marca||''}`.trim()
+  };
+}
+
+// ═══════════════════════════════════════════════════
 // DRAWER BAJAS
 // ═══════════════════════════════════════════════════
 function exportExcel() {
   if (!MACHINES.length) { alert('No hay datos cargados aún.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','FILTROS REQUERIDOS','LUBRICANTES','ACTIVIDADES'];
   const toRow = m => {
     const f = calcFaltan(m);
     const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
+    const kit = getKitResumen(m);
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—',
+      kit.filtros||'—', kit.lubricantes||'—', kit.actividades||'—'];
   };
 
   const panne = MACHINES.filter(m =>
@@ -1944,15 +1963,17 @@ function exportMonth(year, month, evt) {
   evt && evt.stopPropagation();
   if (!MACHINES.length) { alert('No hay datos cargados.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','FILTROS REQUERIDOS','LUBRICANTES','ACTIVIDADES'];
   const toRow = m => {
     const f = calcFaltan(m);
     const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
+    const kit = getKitResumen(m);
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—',
+      kit.filtros||'—', kit.lubricantes||'—', kit.actividades||'—'];
   };
 
   // Todas las máquinas cuyo punto estimado cae en este mes
