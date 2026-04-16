@@ -560,14 +560,14 @@ function parsePautas(wb) {
   if (!wsIdx) return pautas;
   const idxRows = XLSX.utils.sheet_to_json(wsIdx, {header:1, defval:null});
   const indice = [];
-  for (let i = 7; i < idxRows.length; i++) {
+  for (let i = 0; i < idxRows.length; i++) {
     const r = idxRows[i];
     if (!r) continue;
     const tipo = r[1] ? String(r[1]).trim() : '';
     const marca = r[2] ? String(r[2]).trim() : '';
     const modelo = r[3] ? String(r[3]).trim() : '';
     let sn = r[4] != null ? String(r[4]).replace(',','.').trim() : '';
-    if (!tipo || !sn) continue;
+    if (!tipo || !sn || /^TIPO$/i.test(tipo) || /^INDICE$/i.test(sn)) continue;
     indice.push({tipo, marca, modelo, sn});
   }
 
@@ -592,34 +592,106 @@ function _parsePautaSheet(wb, sheetName) {
   const ws = wb.Sheets[sheetName];
   if (!ws) return null;
   const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
-  if (rows.length < 12) return null;
+  if (rows.length < 5) return null;
 
-  const modelo = rows[7] && rows[7][3] ? String(rows[7][3]).trim() : '';
-  const machineCode = rows[7] && rows[7][7] ? String(rows[7][7]).trim() : '';
-  const marca = rows[8] && rows[8][3] ? String(rows[8][3]).trim() : '';
+  let modelo = '', machineCode = '', marca = '';
 
-  // Find section start rows
+  // Escanear dinámicamente buscando MODELO, MARCA, secciones
   let filtrosStart = -1, lubStart = -1, actStart = -1;
-  for (let i = 10; i < rows.length; i++) {
+  let filtrosHeaderCols = {}, lubHeaderCols = {}, actHeaderCols = [];
+
+  for (let i = 0; i < rows.length; i++) {
     const r = rows[i]; if (!r) continue;
-    const v = r[2] ? String(r[2]).toUpperCase().trim() : '';
-    if (filtrosStart<0 && (v==='FILTROS' || v.match(/^FILTROS\b/))) filtrosStart = i;
-    if (lubStart<0 && v.match(/^LUBRICANT/)) lubStart = i;
-    if (actStart<0 && v.match(/^ACTIVIDAD/)) actStart = i;
+
+    for (let c = 0; c < Math.min(r.length, 20); c++) {
+      const v = r[c]; if (!v) continue;
+      const s = String(v).trim().toUpperCase();
+
+      // Buscar MODELO (puede estar en cualquier fila/columna)
+      if (s === 'MODELO' && !modelo) {
+        // El valor está en la celda siguiente
+        for (let cc = c+1; cc < Math.min(c+5, r.length); cc++) {
+          if (r[cc] && String(r[cc]).trim()) { modelo = String(r[cc]).trim(); break; }
+        }
+        // Buscar código de máquina más a la derecha (ej: RC-01, EX-07)
+        for (let cc = c+3; cc < Math.min(c+12, r.length); cc++) {
+          const mv = r[cc];
+          if (mv && /^[A-Za-z]{1,6}-?\d{1,3}$/i.test(String(mv).trim())) {
+            machineCode = String(mv).trim().toUpperCase(); break;
+          }
+        }
+      }
+
+      // Buscar MARCA
+      if (s === 'MARCA' && !marca) {
+        for (let cc = c+1; cc < Math.min(c+5, r.length); cc++) {
+          if (r[cc] && String(r[cc]).trim()) { marca = String(r[cc]).trim(); break; }
+        }
+      }
+
+      // Buscar sección FILTROS
+      if (filtrosStart < 0 && /^FILTROS$/i.test(s)) {
+        filtrosStart = i;
+        // Mapear columnas del header de filtros
+        for (let hc = 0; hc < Math.min(r.length, 20); hc++) {
+          const h = String(r[hc]||'').trim().toUpperCase();
+          if (/^CANT/i.test(h)) filtrosHeaderCols.cant = hc;
+          if (/ORIGINAL|N°.*FILTRO/i.test(h)) filtrosHeaderCols.original = hc;
+          if (/DONAL/i.test(h)) filtrosHeaderCols.donaldson = hc;
+          if (/FLEET/i.test(h)) filtrosHeaderCols.fleetguard = hc;
+          if (/BALW|BALDW/i.test(h)) filtrosHeaderCols.baldwin = hc;
+        }
+      }
+
+      // Buscar sección LUBRICANTES
+      if (lubStart < 0 && /^LUBRICANT/i.test(s)) {
+        lubStart = i;
+        for (let hc = 0; hc < Math.min(r.length, 20); hc++) {
+          const h = String(r[hc]||'').trim().toUpperCase();
+          if (/^CANT/i.test(h)) lubHeaderCols.cant = hc;
+          if (/ESPECIF.*ORIGINAL|ESPECIF.*ORIGIN/i.test(h)) lubHeaderCols.espec = hc;
+          if (/ALTERNATIV/i.test(h)) lubHeaderCols.alt = hc;
+        }
+      }
+
+      // Buscar sección ACTIVIDADES
+      if (actStart < 0 && /^ACTIVIDAD/i.test(s)) {
+        actStart = i;
+        // Detectar columnas de intervalos (números con HRS o KM, o números > 40)
+        for (let hc = 0; hc < Math.min(r.length, 20); hc++) {
+          const hv = r[hc];
+          if (!hv) continue;
+          const hvs = String(hv).trim();
+          if (/\d+\s*(HRS?|KM)/i.test(hvs) || (typeof hv === 'number' && hv >= 50)) {
+            actHeaderCols.push({col:hc, label:hvs, valor: parseFloat(hvs.replace(/[^\d.]/g,''))});
+          }
+        }
+      }
+    }
   }
 
   // Parse FILTROS
   const filtros = [];
   if (filtrosStart >= 0) {
     const end = lubStart > filtrosStart ? lubStart : (actStart > filtrosStart ? actStart : Math.min(filtrosStart+20, rows.length));
+    // Detectar columna del nombre del filtro (primera col con texto largo después del header)
+    let nameCol = 2; // default
+    if (filtrosHeaderCols.cant !== undefined) nameCol = filtrosHeaderCols.cant - 1;
     for (let i = filtrosStart+1; i < end; i++) {
       const r = rows[i]; if (!r) continue;
-      const n = r[2] ? String(r[2]).trim() : '';
-      if (!n || n.length<4 || /^LUBRICANT|^ACTIVIDAD/i.test(n)) break;
-      const cant = r[3] != null ? String(r[3]).trim() : '';
-      const orig = r[4] != null ? String(r[4]).trim() : '';
-      const don = r[6] != null ? String(r[6]).trim() : '';
-      const fleet = r[8] != null ? String(r[8]).trim() : '';
+      // Buscar el nombre del filtro en las primeras columnas
+      let n = '';
+      for (let c = Math.max(0, nameCol-1); c <= Math.min(nameCol+2, r.length-1); c++) {
+        if (r[c] && String(r[c]).trim().length > 4 && /FILTRO|DECANT|ELEMENT|PRE.?FILT/i.test(String(r[c]))) {
+          n = String(r[c]).trim(); nameCol = c; break;
+        }
+      }
+      if (!n) continue;
+      if (/^LUBRICANT|^ACTIVIDAD/i.test(n)) break;
+      const cant = filtrosHeaderCols.cant !== undefined && r[filtrosHeaderCols.cant] != null ? String(r[filtrosHeaderCols.cant]).trim() : '';
+      const orig = filtrosHeaderCols.original !== undefined && r[filtrosHeaderCols.original] != null ? String(r[filtrosHeaderCols.original]).trim() : '';
+      const don = filtrosHeaderCols.donaldson !== undefined && r[filtrosHeaderCols.donaldson] != null ? String(r[filtrosHeaderCols.donaldson]).trim() : '';
+      const fleet = filtrosHeaderCols.fleetguard !== undefined && r[filtrosHeaderCols.fleetguard] != null ? String(r[filtrosHeaderCols.fleetguard]).trim() : '';
       if (cant || orig || don || fleet) filtros.push({nombre:n, cantidad:cant, original:orig, donaldson:don, fleetguard:fleet});
     }
   }
@@ -628,35 +700,40 @@ function _parsePautaSheet(wb, sheetName) {
   const lubricantes = [];
   if (lubStart >= 0) {
     const end = actStart > lubStart ? actStart : Math.min(lubStart+15, rows.length);
+    let nameCol = 2;
+    if (lubHeaderCols.cant !== undefined) nameCol = lubHeaderCols.cant - 1;
     for (let i = lubStart+1; i < end; i++) {
       const r = rows[i]; if (!r) continue;
-      const n = r[2] ? String(r[2]).trim() : '';
-      if (!n || n.length<4 || /^ACTIVIDAD|^NOTA/i.test(n)) break;
-      const cant = r[3] != null ? String(r[3]).trim() : '';
-      const espec = r[4] != null ? String(r[4]).trim() : '';
-      const alt = r[7] != null ? String(r[7]).trim() : '';
+      let n = '';
+      for (let c = Math.max(0, nameCol-1); c <= Math.min(nameCol+2, r.length-1); c++) {
+        if (r[c] && String(r[c]).trim().length > 4 && /ACEITE|REFRIG|ANTICON|COMBUST|GRASA|EJES|EST\./i.test(String(r[c]))) {
+          n = String(r[c]).trim(); nameCol = c; break;
+        }
+      }
+      if (!n) continue;
+      if (/^ACTIVIDAD|^NOTA/i.test(n)) break;
+      const cant = lubHeaderCols.cant !== undefined && r[lubHeaderCols.cant] != null ? String(r[lubHeaderCols.cant]).trim() : '';
+      const espec = lubHeaderCols.espec !== undefined && r[lubHeaderCols.espec] != null ? String(r[lubHeaderCols.espec]).trim() : '';
+      const alt = lubHeaderCols.alt !== undefined && r[lubHeaderCols.alt] != null ? String(r[lubHeaderCols.alt]).trim() : '';
       if (cant || espec) lubricantes.push({nombre:n, cantidad:cant, especificacion:espec, alternativa:alt});
     }
   }
 
   // Parse ACTIVIDADES
-  const actividades = {intervalos:[], items:[]};
-  if (actStart >= 0) {
-    const hdr = rows[actStart];
-    if (hdr) {
-      for (let c = 3; c < Math.min((hdr.length||0), 20); c++) {
-        if (!hdr[c]) continue;
-        const raw = String(hdr[c]).replace(/\s*HRS?\s*/gi,'').replace(/[^\d.]/g,'').trim();
-        const num = parseFloat(raw);
-        if (!isNaN(num) && num > 0) actividades.intervalos.push({col:c, valor:num});
-      }
-    }
+  const actividades = {intervalos: actHeaderCols.map(c => ({col:c.col, valor:c.valor})), items:[]};
+  if (actStart >= 0 && actHeaderCols.length > 0) {
     for (let i = actStart+1; i < Math.min(actStart+30, rows.length); i++) {
       const r = rows[i]; if (!r) continue;
-      const n = r[2] ? String(r[2]).trim() : '';
-      if (!n || n.length<4 || /CANTIDAD DE FILTROS|^NOTA/i.test(n)) break;
-      const marcas = actividades.intervalos.map(iv => {
-        const v = r[iv.col]; return v && String(v).toUpperCase().trim() === 'X';
+      // Buscar nombre de actividad
+      let n = '';
+      for (let c = 0; c < Math.min(r.length, 8); c++) {
+        if (r[c] && typeof r[c] === 'string' && r[c].trim().length > 3 && /CAMBIO|REVISION|ENGRASE|CHEQUEO|REVISAR|LIMPIEZA|CAMBIAR/i.test(r[c])) {
+          n = r[c].trim(); break;
+        }
+      }
+      if (!n) { if (/CANTIDAD DE FILTROS|^NOTA/i.test((r[1]||'')+(r[2]||''))) break; continue; }
+      const marcas = actHeaderCols.map(iv => {
+        const v = r[iv.col]; return v && String(v).trim().toUpperCase() === 'X';
       });
       if (marcas.some(Boolean)) actividades.items.push({nombre:n, marcas});
     }
@@ -1737,9 +1814,14 @@ async function loadData() {
       const wbPautas = await fetchExcel(CONFIG.FILE_PAUTAS);
       PAUTAS_DB = parsePautas(wbPautas);
       _pautasLoaded = PAUTAS_DB.length > 0;
-      console.log(`[Pautas] ${PAUTAS_DB.length} pautas cargadas`);
+      console.log(`[Pautas] ✓ ${PAUTAS_DB.length} pautas cargadas desde "${CONFIG.FILE_PAUTAS}"`);
+      if (PAUTAS_DB.length) {
+        console.log('[Pautas] Ejemplo:', PAUTAS_DB[0].indiceTipo, PAUTAS_DB[0].indiceMarca,
+          '→ Filtros:', PAUTAS_DB[0].filtros.length, '· Lub:', PAUTAS_DB[0].lubricantes.length,
+          '· Act:', PAUTAS_DB[0].actividades.items.length);
+      }
     } catch(e) {
-      console.warn('[Pautas] No se pudo cargar:', e.message);
+      console.warn(`[Pautas] ✗ No se pudo cargar "${CONFIG.FILE_PAUTAS}":`, e.message);
       _pautasLoaded = false;
     }
     setLoading(95, 'Renderizando...');
