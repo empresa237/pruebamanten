@@ -234,6 +234,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
     <option value="panne">🔴 En PANNE</option>
     <option value="soon">🟡 Próximo</option>
     <option value="ok">🟢 Al día</option>
+    <option value="criticos">⚙ Otros Críticos</option>
   </select>
   <div class="tb-sep"></div>
   <div class="legend">
@@ -241,6 +242,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
     <div class="leg"><div class="leg-dot" style="background:#d4a800"></div>Próximo ≤30d</div>
     <div class="leg"><div class="leg-dot" style="background:#1F7145"></div>Al día</div>
     <div class="leg"><div class="leg-dot" style="background:#90a4ae"></div>Sin fecha</div>
+    <div class="leg"><div class="leg-dot" style="background:#ff8c42"></div>⚙ Otros Crit.</div>
     <div class="leg" style="background:#fff3f3;border:1px solid #ffcccc;padding:2px 4px 2px 8px;border-radius:10px;display:none;gap:6px;align-items:center" id="leg-alarm-badge">
       🔕 Sin reporte: <b id="leg-alarm-cnt" style="color:#cc0000">0</b>
       <button onclick="exportSinReporte()" style="background:#cc0000;color:#fff;border:none;border-radius:3px;padding:1px 7px;font-size:9px;font-weight:700;cursor:pointer;line-height:1.6;">📥</button>
@@ -544,12 +546,60 @@ const SHEET_CONFIGS = {
   'semirem': { cod:1, prop:2, kmhr:null, actual:null, faltan:null, razon:null, tipo:'SEMIRREMOLQUE', fechaMotor:null },
 };
 
+// Helper: buscar sección en fila de títulos (row 0) retrocediendo desde columna idx
+function _buscarSeccion(fSec, idx) {
+  if (!fSec) return 'GENERAL';
+  for (let i = idx; i >= 0; i--) {
+    const v = fSec[i];
+    if (v && String(v).trim().length > 1 && isNaN(Number(v))) return String(v).trim().toUpperCase();
+  }
+  return 'GENERAL';
+}
+
+// Helper: detectar TODAS las columnas FALTAN en una hoja, con su sección asociada
+function _detectarColumnasFaltan(ws, range) {
+  // Leer fila 0 (secciones/títulos) y fila 1 (headers)
+  const getCell = (r, c) => { const cell = ws[XLSX.utils.encode_cell({r, c})]; return cell ? cell.v : null; };
+  const fSec = [], fH = [];
+  for (let c = 0; c <= range.e.c; c++) {
+    fSec[c] = getCell(0, c);
+    fH[c]   = getCell(1, c);
+  }
+  const colsF = [];
+  const colsFSet = new Set();
+  fH.forEach((h, i) => {
+    if (!h) return;
+    const hUp = String(h).trim().toUpperCase();
+    // 1) Columna con header explícito "FALTAN"
+    if (hUp === 'FALTAN') {
+      colsFSet.add(i);
+      colsF.push({ idx: i, seccion: _buscarSeccion(fSec, i) });
+    }
+    // 2) Columna PROXIMO → la siguiente suele ser FALTAN (aunque no tenga header)
+    if (hUp.includes('PROXIMO')) {
+      const nextIdx = i + 1;
+      if (nextIdx <= range.e.c && !colsFSet.has(nextIdx)) {
+        const nextH = fH[nextIdx];
+        if (!nextH || String(nextH).trim() === '' || String(nextH).trim().toUpperCase() === 'FALTAN') {
+          colsFSet.add(nextIdx);
+          colsF.push({ idx: nextIdx, seccion: _buscarSeccion(fSec, nextIdx) });
+        }
+      }
+    }
+  });
+  return colsF;
+}
+
 function parseMantencion(wb) {
   const machines = [];
   for (const [shName, cfg] of Object.entries(SHEET_CONFIGS)) {
     const ws = wb.Sheets[shName];
     if (!ws) continue;
     const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+
+    // Detectar TODAS las columnas FALTAN con sus secciones
+    const allFaltanCols = _detectarColumnasFaltan(ws, range);
+
     // Fila 1=título, Fila 2=headers, Fila 3+=datos → índice r empieza en 2 (0-based)
     for (let r = 2; r <= range.e.r; r++) {
       // getV: obtiene valor de columna (1-based como en Excel)
@@ -564,6 +614,11 @@ function parseMantencion(wb) {
         }
         return cell.v;
       };
+      // getCellRaw: obtiene valor directo por índice 0-based
+      const getCellRaw = c => {
+        const cell = ws[XLSX.utils.encode_cell({r, c})];
+        return cell ? cell.v : null;
+      };
 
       const cod = getV(cfg.cod);
       if (!cod || typeof cod !== 'string' || !cod.trim()) continue;
@@ -576,20 +631,33 @@ function parseMantencion(wb) {
       const kmhrRaw = cfg.kmhr ? getV(cfg.kmhr) : null;
       const kmhrVal = String(kmhrRaw || '').trim();
 
-      // FALTAN: diferencia al próximo mantenimiento en KM o HR (número)
+      // FALTAN MOTOR: mantener compatibilidad con la columna principal
       const faltanRaw = getV(cfg.faltan);
       const faltan = (typeof faltanRaw === 'number' && !isNaN(faltanRaw)) ? faltanRaw : null;
 
+      // BLOQUES: leer TODAS las columnas FALTAN detectadas
+      const bloques = [];
+      allFaltanCols.forEach(cf => {
+        const v = getCellRaw(cf.idx);
+        if (v === null || v === undefined) return;
+        const vStr = String(v).replace(/\s+/g, '').trim();
+        if (vStr === '' || vStr.toUpperCase() === 'NO APLICA' || vStr === '#REF!' || vStr === '#VALUE!') return;
+        const n = parseFloat(vStr);
+        if (isNaN(n)) return;
+        bloques.push({ seccion: cf.seccion, faltan: n });
+      });
+
+      // Otros críticos: secciones NO-MOTOR con valor negativo (vencidas)
+      const otrosCriticos = bloques.filter(b => b.seccion !== 'MOTOR' && b.faltan < 0);
+
       // Buscar fechas de vencimiento documentos (permisos, SOAP, rev técnica)
-      // Están en columnas 7,8,9 para hoja 'c' y similares en otras hojas
-      // Las buscamos dinámicamente: primera fecha futura en cols 7-11
       let proxDocDate = null;
       for (let dc = 7; dc <= 11; dc++) {
         const cell = ws[XLSX.utils.encode_cell({r, c: dc-1})];
         if (!cell || cell.t !== 'n' || !cell.z || !/[dmy]/i.test(cell.z)) continue;
         if (!cell.v || cell.v < 40000) continue;
         const d = new Date(Math.round((cell.v - 25569) * 86400000));
-        if (!proxDocDate || d < proxDocDate) proxDocDate = d; // la más próxima a vencer
+        if (!proxDocDate || d < proxDocDate) proxDocDate = d;
       }
 
       const razon = cfg.razon ? String(getV(cfg.razon) || '').trim() : '';
@@ -614,10 +682,12 @@ function parseMantencion(wb) {
         esDisc,
         kmhr: kmhrVal || (actual && typeof actual === 'number' ? 'KM' : ''),
         actual: typeof actual === 'number' ? actual : null,
-        faltan,          // diferencia KM/HR al próximo mantenimiento
-        proxDocDate,     // próxima fecha de vencimiento documento
+        faltan,          // diferencia KM/HR al próximo mantenimiento (MOTOR)
+        bloques,         // TODAS las secciones: [{seccion, faltan}, ...]
+        otrosCriticos,   // secciones NO-MOTOR con faltan < 0
+        proxDocDate,
         razon,
-        fechaMotor,      // fecha último cambio motor (de planilla mantenciones)
+        fechaMotor,
         sheet: shName,
       });
     }
@@ -663,6 +733,8 @@ function mergeMachines(maqList, maintList) {
       litros:     db ? db.litros : null,
       fecha_ult:  db ? db.fecha_ult : null,
       fechaMotor: m.fechaMotor || null,   // fecha último cambio motor (planilla mant.)
+      bloques:    m.bloques || [],         // todas las secciones de mantención
+      otrosCriticos: m.otrosCriticos || [],// secciones NO-MOTOR vencidas
       // Estado final
       estado: (m.esDisc || (db && (db.estado||'').toLowerCase().includes('descontinuad')))
                ? 'DESCONTINUADA' : (db ? db.estado : 'En producción'),
@@ -745,6 +817,7 @@ function getFiltered() {
       if (alerta === 'panne' && ac !== 'danger') return false;
       if (alerta === 'soon' && ac !== 'soon') return false;
       if (alerta === 'ok' && ac !== 'good') return false;
+      if (alerta === 'criticos' && (!m.otrosCriticos || m.otrosCriticos.length === 0)) return false;
     }
     if (q) {
       const txt = [m.cod, m.tipo, m.marca, m.modelo, m.pat, m.familia, m.propietario].join(' ').toLowerCase();
@@ -897,9 +970,16 @@ function renderRows(list) {
       }
     }
 
+    // Alarma otros críticos — ⚙ si tiene secciones NO-MOTOR vencidas
+    let criticosHtml = '';
+    if (!isDisc && m.otrosCriticos && m.otrosCriticos.length > 0) {
+      const lista = m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan).toLocaleString('es-CL')} ${m.kmhr||''}`).join('\n');
+      criticosHtml = `<span class="lr-fuel-alarm" title="⚠ Otros componentes vencidos:\n${lista}" style="color:#e65100">⚙</span>`;
+    }
+
     labHtml += `<div class="lr ${evenCls} ${bajaCls}" data-idx="${i}" onmouseenter="hlRow(${i},true)" onmouseleave="hlRow(${i},false)" onclick="openMdet(${i}, event)">
       <div class="lr-rn" style="width:24px">${i+1}</div>
-      <div class="lr-cod" style="width:80px;color:${codColor}">${stateIco}${m.cod}${alarmHtml}${fuelAlarmHtml}</div>
+      <div class="lr-cod" style="width:80px;color:${codColor}">${stateIco}${m.cod}${alarmHtml}${fuelAlarmHtml}${criticosHtml}</div>
       <div class="lr-tipo" style="width:160px" title="${m.tipo} ${m.marca}">${m.tipo}${m.marca ? ' · <span style="color:#aaa;font-size:9px">'+m.marca+'</span>' : ''}</div>
       <div class="lr-un" style="width:36px">${m.kmhr||'—'}</div>
       <div class="lr-days ${faltanCls}" style="width:64px">${faltanStr}</div>
@@ -1027,6 +1107,7 @@ function renderKpis() {
   const panne = active.filter(m => getAlertClass(m) === 'danger').length;
   const soon = active.filter(m => getAlertClass(m) === 'soon').length;
   const ok = active.filter(m => getAlertClass(m) === 'good').length;
+  const criticos = active.filter(m => m.otrosCriticos && m.otrosCriticos.length > 0).length;
   // Sin reporte count
   const sinRep = _db2Loaded
     ? MACHINES.filter(m => m.estado!=='DESCONTINUADA' && m.last_report &&
@@ -1037,6 +1118,7 @@ function renderKpis() {
     <div class="rkpi r"><div class="rkpi-v">${panne}</div><div class="rkpi-l">En PANNE</div></div>
     <div class="rkpi o"><div class="rkpi-v">${soon}</div><div class="rkpi-l">Próximos</div></div>
     <div class="rkpi g"><div class="rkpi-v">${ok}</div><div class="rkpi-l">Al día</div></div>
+    ${criticos > 0 ? `<div class="rkpi" style="border-left:1px solid rgba(255,255,255,0.15)"><div class="rkpi-v" style="color:#ff8c42">⚙ ${criticos}</div><div class="rkpi-l">Otros Crit.</div></div>` : ''}
     <div class="rkpi"><div class="rkpi-v">${active.length}</div><div class="rkpi-l">Activos</div></div>`;
 
   // Actualizar KPI Sin Reporte (parpadeante en ribbon)
@@ -1093,7 +1175,8 @@ function showTip(e, idx) {
     <div class="tip-row"><span>Patente</span><span>${m.pat||'—'}</span></div>
     <div class="tip-row"><span>Estado</span><span>${m.estado}</span></div>
     <div class="tip-row"><span>Actual</span><span>${m.hr_act||m.km_act||m.actual||'—'} ${m.kmhr}</span></div>
-    <div class="tip-row"><span>Próximo mantenimiento</span><span>${fStr}</span></div>`;
+    <div class="tip-row"><span>Próximo mantenimiento</span><span>${fStr}</span></div>
+    ${m.otrosCriticos && m.otrosCriticos.length > 0 ? `<div style="margin-top:4px;padding-top:4px;border-top:1px solid #444"><span style="color:#ff6b6b;font-size:10px;font-weight:700">⚠ Otros críticos:</span>${m.otrosCriticos.map(b=>`<div style="color:#ffaa88;font-size:10px;margin-left:6px">· ${b.seccion}: ${Math.round(b.faltan).toLocaleString('es-CL')} ${m.kmhr||''}</div>`).join('')}</div>` : ''}`;
   tip.style.display = 'block';
   moveTip(e);
 }
@@ -1188,7 +1271,26 @@ function openMdet(idx, e) {
         <div class="modal-field"><label>🔧 Fecha última mantención</label><span style="font-weight:700;color:#1F7145">${m.fechaMotor ? m.fechaMotor.toLocaleDateString('es-CL') : '—'}</span></div>
         ${m.litros ? `<div class="modal-field"><label>Litros última recarga</label><span>${m.litros} L</span></div>` : ''}
       </div>
-    </div>`;
+    </div>
+    ${m.bloques && m.bloques.length > 0 ? `
+    <div class="modal-section">
+      <div class="modal-section-title">Detalle por Componente</div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        ${m.bloques.map(b => {
+          const v = Math.round(b.faltan);
+          const isNeg = v < 0;
+          const isWarn = b.seccion === 'MOTOR' ? (m.kmhr==='Km' ? v <= 1600 : v <= 160) : v <= 0;
+          const color = isNeg ? '#cc0000' : isWarn ? '#9c6500' : '#276221';
+          const bg = isNeg ? '#fff0f0' : isWarn ? '#fffbe6' : '#f0fff4';
+          const icon = isNeg ? '🔴' : isWarn ? '🟡' : '🟢';
+          return `<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;background:${bg};border-radius:3px;border-left:3px solid ${color}">
+            <span style="font-size:11px">${icon}</span>
+            <span style="font-size:10px;font-weight:700;min-width:170px;color:#444">${b.seccion}</span>
+            <span style="font-size:11px;font-weight:700;color:${color}">${v < 0 ? '⚠ VENCIDA' : ''} ${Math.abs(v).toLocaleString('es-CL')} ${m.kmhr || ''} ${isNeg ? 'pasados' : 'restantes'}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : ''}`;
   document.getElementById('modal-overlay').classList.add('show');
 }
 function closeModal(e) {
@@ -1202,9 +1304,14 @@ function closeModal(e) {
 function exportExcel() {
   if (!MACHINES.length) { alert('No hay datos cargados aún.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE','COMPONENTE','NOTAS'];
-  const toRow = m => [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-    m.faltan !== null ? m.faltan : '—', m.razon||'—', ''];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const toRow = m => {
+    const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
+      ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
+      : '—';
+    return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
+      m.faltan !== null ? m.faltan : '—', criticosStr, m.razon||'—', ''];
+  };
 
   const panne = MACHINES.filter(m =>
     m.estado !== 'DESCONTINUADA' && m.faltan !== null && m.faltan < 0
@@ -1231,13 +1338,19 @@ function exportExcel() {
   if (panne.length) {
     HDR.forEach((_,ci) => { const a=XLSX.utils.encode_cell({r:ri,c:ci}); if(ws[a]) ws[a].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}},font:{bold:true}}; });
     ri++;
-    for (let i=0;i<panne.length;i++,ri++) { const a=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a]) ws[a].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}},font:{bold:true}}; }
+    for (let i=0;i<panne.length;i++,ri++) {
+      const a5=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a5]) ws[a5].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}},font:{bold:true}};
+      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
+    }
     if (proximos.length) ri += 4;
   }
   if (proximos.length) {
     HDR.forEach((_,ci) => { const a=XLSX.utils.encode_cell({r:ri,c:ci}); if(ws[a]) ws[a].s={fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}},font:{bold:true}}; });
     ri++;
-    for (let i=0;i<proximos.length;i++,ri++) { const a=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a]) ws[a].s={fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}},font:{bold:true}}; }
+    for (let i=0;i<proximos.length;i++,ri++) {
+      const a5=XLSX.utils.encode_cell({r:ri,c:5}); if(ws[a5]) ws[a5].s={fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}},font:{bold:true}};
+      const a6=XLSX.utils.encode_cell({r:ri,c:6}); if(ws[a6] && String(ws[a6].v||'')!=='—') ws[a6].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}},font:{bold:true}};
+    }
   }
 
   XLSX.utils.book_append_sheet(wb, ws, 'Mantención');
@@ -1375,9 +1488,14 @@ function exportMonth(year, month, evt) {
   evt && evt.stopPropagation();
   if (!MACHINES.length) { alert('No hay datos cargados.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE','COMPONENTE','NOTAS'];
-  const toRow = m => [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-    m.faltan !== null ? m.faltan : '—', m.razon||'—', ''];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','OTROS COMPONENTES CRÍTICOS','COMPONENTE','NOTAS'];
+  const toRow = m => {
+    const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
+      ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
+      : '—';
+    return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
+      m.faltan !== null ? m.faltan : '—', criticosStr, m.razon||'—', ''];
+  };
 
   // Todas las máquinas cuyo punto estimado cae en este mes
   const enMes = MACHINES.filter(m => {
@@ -1401,7 +1519,7 @@ function exportMonth(year, month, evt) {
     if (ws[a]) ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
   });
 
-  // Color en columna HR O KM FALTANTE según valor
+  // Color en columna HR O KM FALTANTE según valor + Otros Críticos
   for (let r = 1; r < allRows.length; r++) {
     const v = parseFloat(allRows[r][5]);
     const isKm = /km/i.test(String(allRows[r][4]||''));
@@ -1409,6 +1527,11 @@ function exportMonth(year, month, evt) {
     if (!isNaN(v) && ws[a]) {
       if (v < 0)                                      ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}}, font:{bold:true} };
       else if ((isKm && v<=1600)||(!isKm && v<=160))  ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}}, font:{bold:true} };
+    }
+    // Otros Críticos col 6: rojo claro si tiene contenido
+    const a6 = XLSX.utils.encode_cell({r, c:6});
+    if (ws[a6] && String(ws[a6].v||'') !== '—' && String(ws[a6].v||'').trim() !== '') {
+      ws[a6].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}}, font:{bold:true} };
     }
   }
 
