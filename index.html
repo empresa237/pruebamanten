@@ -1716,17 +1716,15 @@ function getKitResumen(m) {
 function exportExcel() {
   if (!MACHINES.length) { alert('No hay datos cargados aún.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','FILTROS REQUERIDOS','LUBRICANTES','ACTIVIDADES'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','INSUMOS'];
   const toRow = m => {
     const f = calcFaltan(m);
     const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
-    const kit = getKitResumen(m);
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—',
-      kit.filtros||'—', kit.lubricantes||'—', kit.actividades||'—'];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
   };
 
   const panne = MACHINES.filter(m =>
@@ -1739,10 +1737,18 @@ function exportExcel() {
     return (isKm && m.faltan <= 1600) || (!isKm && m.faltan <= 160);
   }).sort((a,b) => a.faltan - b.faltan);
 
+  // Construir filas hoja 1 y rastrear qué fila Excel corresponde a cada máquina
   const allRows = [];
-  if (panne.length)    { allRows.push(HDR); panne.forEach(m => allRows.push(toRow(m))); }
+  const machineRowMap = []; // [{machine, excelRow}]
+  if (panne.length) {
+    allRows.push(HDR);
+    panne.forEach(m => { machineRowMap.push({m, excelRow: allRows.length}); allRows.push(toRow(m)); });
+  }
   if (panne.length && proximos.length) { allRows.push([],[],[],[]); }
-  if (proximos.length) { allRows.push(HDR); proximos.forEach(m => allRows.push(toRow(m))); }
+  if (proximos.length) {
+    allRows.push(HDR);
+    proximos.forEach(m => { machineRowMap.push({m, excelRow: allRows.length}); allRows.push(toRow(m)); });
+  }
   if (!allRows.length) { alert('No hay máquinas en PANNE ni próximas a mantención.'); return; }
 
   const wb = XLSX.utils.book_new();
@@ -1750,7 +1756,9 @@ function exportExcel() {
   ws['!cols'] = HDR.map((_,ci) => ({wch: Math.min(40, Math.max(10,
     ...allRows.map(r => String(r[ci]||'').length)))}));
 
+  // Estilos hoja 1
   let ri = 0;
+  const linkCol = HDR.length - 1; // última columna = INSUMOS
   if (panne.length) {
     HDR.forEach((_,ci) => { const a=XLSX.utils.encode_cell({r:ri,c:ci}); if(ws[a]) ws[a].s={fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}},font:{bold:true}}; });
     ri++;
@@ -1773,45 +1781,70 @@ function exportExcel() {
 
   XLSX.utils.book_append_sheet(wb, ws, 'Mantención');
 
-  // Hoja 2: INSUMOS
-  if (_pautasLoaded) {
-    const allMachines = [...panne, ...proximos];
-    const insRows = [['INSUMOS DE MANTENCIÓN — ' + today.toLocaleDateString('es-CL')],[]];
-    allMachines.forEach(m => {
-      const pauta = matchPauta(m);
-      if (!pauta) {
-        insRows.push([m.cod, m.tipo||'', m.marca||'', '⚠ SIN PAUTA ASOCIADA']);
-        insRows.push([]);
-        return;
-      }
-      const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
-      const actList = getKitActividades(pauta, proximoVal);
-      insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} ▬▬`]);
-      if (pauta.filtros.length) {
-        insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
-        pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
-      }
-      if (pauta.lubricantes.length) {
-        insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
-        pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
-      }
-      if (actList.length) {
-        insRows.push(['','ACTIVIDADES' + (proximoVal ? ` (próx: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
-        actList.forEach(a => insRows.push(['', '✓ ' + a]));
-      }
+  // Hoja 2: INSUMOS con hipervínculos bidireccionales
+  const allMachines = [...panne, ...proximos];
+  const insRows = [['INSUMOS DE MANTENCIÓN — ' + today.toLocaleDateString('es-CL')],[]];
+  const insCodeRowMap = {}; // { codMaquina: filaEnInsumos }
+
+  allMachines.forEach(m => {
+    insCodeRowMap[m.cod] = insRows.length; // guardar fila donde empieza esta máquina
+    const pauta = _pautasLoaded ? matchPauta(m) : null;
+    if (!pauta) {
+      insRows.push([m.cod + ' — ' + (m.tipo||'') + ' ' + (m.marca||''), '', '', '⚠ SIN PAUTA ASOCIADA', '', '', '', 'Volver']);
       insRows.push([]);
-    });
-    const wsIns = XLSX.utils.aoa_to_sheet(insRows);
-    wsIns['!cols'] = [{wch:4},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16}];
-    for (let r = 0; r < insRows.length; r++) {
-      if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
-        const a = XLSX.utils.encode_cell({r, c:0});
-        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
-      }
+      return;
     }
-    XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
+    const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+    const actList = getKitActividades(pauta, proximoVal);
+    // Título máquina + Volver en última columna
+    insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} — Pauta: ${pauta.indiceTipo} ${pauta.indiceMarca||pauta.marca} ▬▬`, '','','','','','', 'Volver']);
+    if (pauta.filtros.length) {
+      insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
+      pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
+    }
+    if (pauta.lubricantes.length) {
+      insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
+      pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
+    }
+    if (actList.length) {
+      insRows.push(['','ACTIVIDADES' + (proximoVal ? ` (próx: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
+      actList.forEach(a => insRows.push(['', '✓ ' + a]));
+    }
+    insRows.push([]);
+  });
+
+  const wsIns = XLSX.utils.aoa_to_sheet(insRows);
+  wsIns['!cols'] = [{wch:50},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16},{wch:4},{wch:10}];
+
+  // Estilos hoja Insumos
+  for (let r = 0; r < insRows.length; r++) {
+    if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
+      const a = XLSX.utils.encode_cell({r, c:0});
+      if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
+    }
+    if (insRows[r][0] && String(insRows[r][0]).includes('SIN PAUTA')) {
+      const a = XLSX.utils.encode_cell({r, c:3});
+      if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFF3CD'}}, font:{bold:true, color:{rgb:'FF856404'}} };
+    }
   }
 
+  // Hipervínculos: Hoja1 "Ver +" → Insumos, Insumos "Volver" → Hoja1
+  const linkStyle = {font:{color:{rgb:'FF0563C1'},underline:true,bold:true}};
+  const volverStyle = {font:{color:{rgb:'FF1F7145'},underline:true,bold:true}};
+
+  machineRowMap.forEach(({m, excelRow}) => {
+    const insRow = insCodeRowMap[m.cod];
+    if (insRow === undefined) return;
+    // "Ver +" en hoja Mantención
+    const cellRef = XLSX.utils.encode_cell({r: excelRow, c: linkCol});
+    ws[cellRef] = {v: 'Ver +', t:'s', l:{Target: `#Insumos!A${insRow+1}`}, s: linkStyle};
+    // "Volver" en hoja Insumos
+    const volverCol = 7;
+    const volverRef = XLSX.utils.encode_cell({r: insRow, c: volverCol});
+    wsIns[volverRef] = {v: 'Volver', t:'s', l:{Target: `#'Mantención'!A${excelRow+1}`}, s: volverStyle};
+  });
+
+  XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
   const fecha = today.toISOString().slice(0,10);
   XLSX.writeFile(wb, `control_mantencion_${fecha}.xlsx`, {cellStyles:true});
 }
@@ -1963,20 +1996,17 @@ function exportMonth(year, month, evt) {
   evt && evt.stopPropagation();
   if (!MACHINES.length) { alert('No hay datos cargados.'); return; }
 
-  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','FILTROS REQUERIDOS','LUBRICANTES','ACTIVIDADES'];
+  const HDR = ['COD','TIPO MAQUINARIA','PATENTE','MARCA','TIPO','HR O KM FALTANTE (MOTOR)','FECHA ESTIMADA','OTROS COMPONENTES CRÍTICOS','COMPONENTE','INSUMOS'];
   const toRow = m => {
     const f = calcFaltan(m);
     const fechaStr = (f.isDate && f.date) ? f.date.toLocaleDateString('es-CL') : '—';
     const criticosStr = (m.otrosCriticos && m.otrosCriticos.length > 0)
       ? m.otrosCriticos.map(b => `${b.seccion}: ${Math.round(b.faltan)} ${m.kmhr||''}`).join(' | ')
       : '—';
-    const kit = getKitResumen(m);
     return [m.cod, m.tipo||'—', m.pat||'—', m.marca||'—', m.kmhr||'—',
-      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—',
-      kit.filtros||'—', kit.lubricantes||'—', kit.actividades||'—'];
+      m.faltan !== null ? m.faltan : '—', fechaStr, criticosStr, m.razon||'—', ''];
   };
 
-  // Todas las máquinas cuyo punto estimado cae en este mes
   const enMes = MACHINES.filter(m => {
     if (m.estado === 'DESCONTINUADA') return false;
     const f = calcFaltan(m);
@@ -1986,11 +2016,17 @@ function exportMonth(year, month, evt) {
 
   if (!enMes.length) { alert('No hay mantenciones estimadas para ese mes.'); return; }
 
-  const allRows = [HDR, ...enMes.map(toRow)];
+  // Construir hoja 1 rastreando filas
+  const allRows = [HDR];
+  const machineRowMap = [];
+  enMes.forEach(m => { machineRowMap.push({m, excelRow: allRows.length}); allRows.push(toRow(m)); });
+
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(allRows);
   ws['!cols'] = HDR.map((_,ci) => ({wch: Math.min(40, Math.max(12,
     ...allRows.map(r => String(r[ci]||'').length)))}));
+
+  const linkCol = HDR.length - 1;
 
   // Header verde Harcha
   HDR.forEach((_,ci) => {
@@ -1998,7 +2034,7 @@ function exportMonth(year, month, evt) {
     if (ws[a]) ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
   });
 
-  // Color en columna HR O KM FALTANTE según valor + Fecha + Otros Críticos
+  // Estilos por fila
   for (let r = 1; r < allRows.length; r++) {
     const v = parseFloat(allRows[r][5]);
     const isKm = /km/i.test(String(allRows[r][4]||''));
@@ -2007,12 +2043,10 @@ function exportMonth(year, month, evt) {
       if (v < 0)                                      ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF0000'}}, font:{bold:true} };
       else if ((isKm && v<=1600)||(!isKm && v<=160))  ws[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFFF00'}}, font:{bold:true} };
     }
-    // Fecha estimada col 6: azul claro
     const a6 = XLSX.utils.encode_cell({r, c:6});
     if (ws[a6] && String(ws[a6].v||'') !== '—') {
       ws[a6].s = { fill:{patternType:'solid',fgColor:{rgb:'FFDCE6F1'}}, font:{bold:true, color:{rgb:'FF1a3a5c'}} };
     }
-    // Otros Críticos col 7: rojo claro si tiene contenido
     const a7 = XLSX.utils.encode_cell({r, c:7});
     if (ws[a7] && String(ws[a7].v||'') !== '—' && String(ws[a7].v||'').trim() !== '') {
       ws[a7].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFF9999'}}, font:{bold:true} };
@@ -2022,49 +2056,64 @@ function exportMonth(year, month, evt) {
   const nomMes = new Date(year, month, 1).toLocaleString('es-CL',{month:'long',year:'numeric'}).replace(/ /g,'_');
   XLSX.utils.book_append_sheet(wb, ws, 'Mantención');
 
-  // Hoja 2: INSUMOS — Kit de mantención por máquina
-  if (_pautasLoaded) {
-    const insRows = [['INSUMOS DE MANTENCIÓN — ' + nomMes.replace(/_/g,' ').toUpperCase()],[]];
-    enMes.forEach(m => {
-      const pauta = matchPauta(m);
-      if (!pauta) {
-        insRows.push([m.cod, m.tipo||'', m.marca||'', '⚠ SIN PAUTA ASOCIADA — verificar insumos manualmente']);
-        insRows.push([]);
-        return;
-      }
-      const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
-      const actList = getKitActividades(pauta, proximoVal);
-      insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} — Pauta: ${pauta.indiceTipo} ${pauta.indiceMarca||pauta.marca} ▬▬`]);
-      if (pauta.filtros.length) {
-        insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
-        pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
-      }
-      if (pauta.lubricantes.length) {
-        insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
-        pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
-      }
-      if (actList.length) {
-        insRows.push(['','ACTIVIDADES A REALIZAR' + (proximoVal ? ` (próximo: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
-        actList.forEach(a => insRows.push(['', '✓ ' + a]));
-      }
+  // Hoja 2: INSUMOS con hipervínculos bidireccionales
+  const insRows = [['INSUMOS DE MANTENCIÓN — ' + nomMes.replace(/_/g,' ').toUpperCase()],[]];
+  const insCodeRowMap = {};
+
+  enMes.forEach(m => {
+    insCodeRowMap[m.cod] = insRows.length;
+    const pauta = _pautasLoaded ? matchPauta(m) : null;
+    if (!pauta) {
+      insRows.push([m.cod + ' — ' + (m.tipo||'') + ' ' + (m.marca||''), '', '', '⚠ SIN PAUTA ASOCIADA', '', '', '', 'Volver']);
       insRows.push([]);
-    });
-    const wsIns = XLSX.utils.aoa_to_sheet(insRows);
-    wsIns['!cols'] = [{wch:4},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16}];
-    // Estilo título de cada máquina (filas con ▬▬)
-    for (let r = 0; r < insRows.length; r++) {
-      if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
-        const a = XLSX.utils.encode_cell({r, c:0});
-        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
-      }
-      if (insRows[r][0] && String(insRows[r][0]).includes('SIN PAUTA')) {
-        const a = XLSX.utils.encode_cell({r, c:3});
-        if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFF3CD'}}, font:{bold:true, color:{rgb:'FF856404'}} };
-      }
+      return;
     }
-    XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
+    const proximoVal = m.actual && m.faltan != null ? Math.round(m.actual + m.faltan) : null;
+    const actList = getKitActividades(pauta, proximoVal);
+    insRows.push([`▬▬ ${m.cod} — ${m.tipo||''} ${m.marca||''} — Pauta: ${pauta.indiceTipo} ${pauta.indiceMarca||pauta.marca} ▬▬`, '','','','','','', 'Volver']);
+    if (pauta.filtros.length) {
+      insRows.push(['','FILTRO','CANT.','N° ORIGINAL','DONALDSON','FLEETGUARD']);
+      pauta.filtros.forEach(f => insRows.push(['', f.nombre, f.cantidad, f.original||'', f.donaldson||'', f.fleetguard||'']));
+    }
+    if (pauta.lubricantes.length) {
+      insRows.push(['','LUBRICANTE','CANT.','ESPECIFICACIÓN','ALTERNATIVA']);
+      pauta.lubricantes.forEach(l => insRows.push(['', l.nombre, l.cantidad, l.especificacion||'', l.alternativa||'']));
+    }
+    if (actList.length) {
+      insRows.push(['','ACTIVIDADES' + (proximoVal ? ` (próx: ${Math.round(proximoVal).toLocaleString('es-CL')} ${m.kmhr||''})` : '')]);
+      actList.forEach(a => insRows.push(['', '✓ ' + a]));
+    }
+    insRows.push([]);
+  });
+
+  const wsIns = XLSX.utils.aoa_to_sheet(insRows);
+  wsIns['!cols'] = [{wch:50},{wch:36},{wch:10},{wch:20},{wch:16},{wch:16},{wch:4},{wch:10}];
+
+  for (let r = 0; r < insRows.length; r++) {
+    if (insRows[r][0] && String(insRows[r][0]).includes('▬▬')) {
+      const a = XLSX.utils.encode_cell({r, c:0});
+      if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FF1F7145'}}, font:{bold:true, color:{rgb:'FFFFFFFF'}} };
+    }
+    if (insRows[r][3] && String(insRows[r][3]).includes('SIN PAUTA')) {
+      const a = XLSX.utils.encode_cell({r, c:3});
+      if (wsIns[a]) wsIns[a].s = { fill:{patternType:'solid',fgColor:{rgb:'FFFFF3CD'}}, font:{bold:true, color:{rgb:'FF856404'}} };
+    }
   }
 
+  // Hipervínculos bidireccionales
+  const linkStyle = {font:{color:{rgb:'FF0563C1'},underline:true,bold:true}};
+  const volverStyle = {font:{color:{rgb:'FF1F7145'},underline:true,bold:true}};
+
+  machineRowMap.forEach(({m, excelRow}) => {
+    const insRow = insCodeRowMap[m.cod];
+    if (insRow === undefined) return;
+    const cellRef = XLSX.utils.encode_cell({r: excelRow, c: linkCol});
+    ws[cellRef] = {v: 'Ver +', t:'s', l:{Target: `#Insumos!A${insRow+1}`}, s: linkStyle};
+    const volverRef = XLSX.utils.encode_cell({r: insRow, c: 7});
+    wsIns[volverRef] = {v: 'Volver', t:'s', l:{Target: `#'Mantención'!A${excelRow+1}`}, s: volverStyle};
+  });
+
+  XLSX.utils.book_append_sheet(wb, wsIns, 'Insumos');
   XLSX.writeFile(wb, `mantencion_${nomMes}.xlsx`, {cellStyles:true});
 }
 function exportSinReporte() {
