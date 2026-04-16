@@ -589,38 +589,54 @@ function parsePautas(wb) {
 }
 
 function _parsePautaSheet(wb, sheetName) {
-  const ws = wb.Sheets[sheetName];
-  if (!ws) return null;
-  const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
-  if (rows.length < 5) return null;
+    const ws = wb.Sheets[sheetName];
+    if (!ws) return null;
+    const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+    if (rows.length < 5) return null;
 
-  let modelo = '', machineCode = '', marca = '';
+    let modelo = "", machineCode = "", marca = "";
+    
+    // 1. ESCANEO DINÁMICO: Buscamos MODELO y MARCA en cualquier fila
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+        const row = rows[i] || [];
+        row.forEach((cell, idx) => {
+            const val = String(cell || "").toUpperCase();
+            if (val.includes("MODELO:")) modelo = String(row[idx + 1] || "").trim();
+            if (val.includes("MARCA:")) marca = String(row[idx + 1] || "").trim();
+            if (val.includes("CODIGO:") || val.includes("CÓDIGO:")) machineCode = String(row[idx + 1] || "").trim();
+        });
+    }
 
-  // Escanear dinámicamente buscando MODELO, MARCA, secciones
-  let filtrosStart = -1, lubStart = -1, actStart = -1;
-  let filtrosHeaderCols = {}, lubHeaderCols = {}, actHeaderCols = [];
+    // 2. DETECCIÓN DE SECCIONES (Filtros, Lubricantes, Actividades)
+    let secciones = { filtros: [], lubricantes: [], actividades: [] };
+    let currentSection = null;
 
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i]; if (!r) continue;
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i] || [];
+        const firstCell = String(row[0] || "").toUpperCase();
 
-    for (let c = 0; c < Math.min(r.length, 20); c++) {
-      const v = r[c]; if (!v) continue;
-      const s = String(v).trim().toUpperCase();
+        if (firstCell.includes("FILTROS")) { currentSection = "filtros"; continue; }
+        if (firstCell.includes("LUBRICANTES")) { currentSection = "lubricantes"; continue; }
+        if (firstCell.includes("ACTIVIDADES") || firstCell.includes("DESCRIPCION")) { currentSection = "actividades"; continue; }
 
-      // Buscar MODELO (puede estar en cualquier fila/columna)
-      if (s === 'MODELO' && !modelo) {
-        // El valor está en la celda siguiente
-        for (let cc = c+1; cc < Math.min(c+5, r.length); cc++) {
-          if (r[cc] && String(r[cc]).trim()) { modelo = String(r[cc]).trim(); break; }
+        // Si estamos en una sección y la fila tiene datos, guardamos
+        if (currentSection && row[0] && row[0] !== "ITEM") {
+            secciones[currentSection].push({
+                desc: row[0],
+                frec: row[1] || "",
+                extra: row[2] || ""
+            });
         }
-        // Buscar código de máquina más a la derecha (ej: RC-01, EX-07)
-        for (let cc = c+3; cc < Math.min(c+12, r.length); cc++) {
-          const mv = r[cc];
-          if (mv && /^[A-Za-z]{1,6}-?\d{1,3}$/i.test(String(mv).trim())) {
-            machineCode = String(mv).trim().toUpperCase(); break;
-          }
-        }
-      }
+    }
+
+    return {
+        sn: sheetName,
+        modelo: modelo,
+        marca: marca,
+        code: machineCode,
+        data: secciones
+    };
+}
 
       // Buscar MARCA
       if (s === 'MARCA' && !marca) {
