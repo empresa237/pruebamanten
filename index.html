@@ -405,7 +405,7 @@ function getUsoDiario(tipo, kmhr) {
 let MACHINES = [];
 let DB_MAQUINAS = [];
 let RATE_LOOKUP = {}; // { 'C-02': { last_report: '...', last_fuel: '...' } }
-let OT_PREVENTIVA = {}; // { 'CM-01': {otId, estado} } — OTs preventivas abiertas
+let OT_PREVENTIVA = {}; // { 'CM-01': {otId, estado, fecha} }
 let _db2Loaded = false;
 let _sortByUrgency = false;
 let PAUTAS_DB = [];  // [{tipo,marca,modelo,sheetName,filtros,lubricantes,actividades}]
@@ -555,7 +555,7 @@ function buildRateLookup(wb) {
 }
 
 // ═══════════════════════════════════════════════════
-// OT PREVENTIVAS ABIERTAS
+// OT PREVENTIVAS ABIERTAS (lectura optimizada)
 // ═══════════════════════════════════════════════════
 function buildOTLookup(wb) {
   const lookup = {};
@@ -563,35 +563,44 @@ function buildOTLookup(wb) {
   const wsMaq = wb.Sheets['MAQUINAS'];
   if (!wsOT || !wsMaq) return lookup;
 
-  // 1. Mapear ID_MAQUINA → código (ej: "m000008" → "CM-01")
+  // 1. Mapear ID_MAQUINA → código rápido (acceso directo a celdas)
   const idToCod = {};
-  const maqRows = XLSX.utils.sheet_to_json(wsMaq, {header:1, defval:null});
-  for (let i = 1; i < maqRows.length; i++) {
-    const r = maqRows[i]; if (!r) continue;
-    const mid = String(r[0]||'').trim();
-    const codFull = String(r[1]||'').trim(); // "CM-01 YZ6869"
-    if (!mid || !codFull) continue;
-    const cod = codFull.split(/\s+/)[0].toUpperCase(); // "CM-01"
-    idToCod[mid] = cod;
+  const maqRange = XLSX.utils.decode_range(wsMaq['!ref']||'A1');
+  for (let r = 1; r <= maqRange.e.r; r++) {
+    const cId = wsMaq[XLSX.utils.encode_cell({r,c:0})];
+    const cCod = wsMaq[XLSX.utils.encode_cell({r,c:1})];
+    if (!cId || !cCod) continue;
+    const mid = String(cId.v||'').trim();
+    const codFull = String(cCod.v||'').trim();
+    if (mid && codFull) idToCod[mid] = codFull.split(/\s+/)[0].toUpperCase();
   }
 
-  // 2. Buscar OT preventivas con estado Trabajando o En espera
-  const otRows = XLSX.utils.sheet_to_json(wsOT, {header:1, defval:null});
-  for (let i = 1; i < otRows.length; i++) {
-    const r = otRows[i]; if (!r) continue;
-    const tipo = String(r[5]||'').trim();     // TIPO_ORDEN (col 5)
-    const estado = String(r[49]||'').trim();  // Estado_Orden (col 49)
-    const mid = String(r[1]||'').trim();      // ID_MAQUINA (col 1)
-    const otId = String(r[0]||'').trim();     // ID_ORDEN (col 0)
+  // 2. Buscar OT preventivas abiertas (solo cols 0,1,2,5,49)
+  const otRange = XLSX.utils.decode_range(wsOT['!ref']||'A1');
+  for (let r = 1; r <= otRange.e.r; r++) {
+    const cTipo   = wsOT[XLSX.utils.encode_cell({r,c:5})];
+    const cEstado = wsOT[XLSX.utils.encode_cell({r,c:49})];
+    if (!cTipo || !cEstado) continue;
+    const tipo   = String(cTipo.v||'').trim();
+    const estado = String(cEstado.v||'').trim();
+    if (!/preventivo/i.test(tipo) || !/trabajando|en espera/i.test(estado)) continue;
 
-    if (/preventivo/i.test(tipo) && /trabajando|en espera/i.test(estado)) {
-      const cod = idToCod[mid];
-      if (cod) {
-        lookup[cod] = { otId, estado, tipo };
-        console.log(`[OT] Preventiva abierta: ${cod} → ${otId} (${estado})`);
-      }
+    const cId    = wsOT[XLSX.utils.encode_cell({r,c:1})];
+    const cOtId  = wsOT[XLSX.utils.encode_cell({r,c:0})];
+    const cFecha = wsOT[XLSX.utils.encode_cell({r,c:2})];
+    const mid    = cId ? String(cId.v||'').trim() : '';
+    const otId   = cOtId ? String(cOtId.v||'').trim() : '';
+    let fecha    = '';
+    if (cFecha) {
+      if (cFecha.t === 'd') fecha = cFecha.v instanceof Date ? cFecha.v.toLocaleDateString('es-CL') : String(cFecha.v);
+      else if (cFecha.t === 'n' && cFecha.v > 40000) fecha = new Date(Math.round((cFecha.v-25569)*86400000)).toLocaleDateString('es-CL');
+      else fecha = String(cFecha.v||'').substring(0,10);
     }
+
+    const cod = idToCod[mid];
+    if (cod) lookup[cod] = { otId, estado, fecha };
   }
+  console.log(`[OT] ${Object.keys(lookup).length} máquinas con OT preventiva abierta:`, Object.keys(lookup).join(', '));
   return lookup;
 }
 
@@ -1329,7 +1338,6 @@ function renderRows(list) {
     const propLabel = m.propietario && !m.esDisc ? m.propietario : (m.estado || '—');
 
     // LEFT ROW
-    // Color del código según urgencia
     const codColor = isDisc ? '#888' : (ac==='danger' ? '#cc0000' : ac==='soon' ? '#d4a800' : '#1F7145');
     const stateIco = (!isDisc && ac==='danger') ? '🚨 ' : '';
 
@@ -1343,7 +1351,7 @@ function renderRows(list) {
       }
     }
 
-    // Alarma combustible — ⛽ si sin reporte 2+ días y tiene registro de carga (excluir camionetas)
+    // Alarma combustible — ⛽ (excluir camionetas)
     let fuelAlarmHtml = '';
     if (!isDisc && m.last_fuel && m.last_report && !/camioneta/i.test(m.tipo||'')) {
       const diffReport = (today.getTime() - new Date(m.last_report).getTime()) / 86400000;
@@ -1566,7 +1574,7 @@ function showTip(e, idx) {
     <div class="tip-row"><span>Estado</span><span>${m.estado}</span></div>
     <div class="tip-row"><span>Actual</span><span>${m.hr_act||m.km_act||m.actual||'—'} ${m.kmhr}</span></div>
     <div class="tip-row"><span>Próximo mantenimiento</span><span>${fStr}</span></div>
-    ${OT_PREVENTIVA[m.cod] ? `<div style="margin-top:4px;padding:3px 6px;background:#1565c0;color:#fff;border-radius:3px;font-size:10px;font-weight:700">🔧 OT Preventiva: ${OT_PREVENTIVA[m.cod].estado} (${OT_PREVENTIVA[m.cod].otId})</div>` : ''}
+    ${OT_PREVENTIVA[m.cod] ? `<div style="margin-top:4px;padding:3px 6px;background:#1565c0;color:#fff;border-radius:3px;font-size:10px;font-weight:700">🔧 OT ${OT_PREVENTIVA[m.cod].otId} — ${OT_PREVENTIVA[m.cod].estado} (${OT_PREVENTIVA[m.cod].fecha})</div>` : ''}
     ${m.otrosCriticos && m.otrosCriticos.length > 0 ? `<div style="margin-top:4px;padding-top:4px;border-top:1px solid #444"><span style="color:#ff6b6b;font-size:10px;font-weight:700">⚠ Otros críticos:</span>${m.otrosCriticos.map(b=>`<div style="color:#ffaa88;font-size:10px;margin-left:6px">· ${b.seccion}: ${Math.round(b.faltan).toLocaleString('es-CL')} ${m.kmhr||''}</div>`).join('')}</div>` : ''}`;
   tip.style.display = 'block';
   moveTip(e);
@@ -1663,6 +1671,17 @@ function openMdet(idx, e) {
         ${m.litros ? `<div class="modal-field"><label>Litros última recarga</label><span>${m.litros} L</span></div>` : ''}
       </div>
     </div>
+    ${OT_PREVENTIVA[m.cod] ? `
+    <div class="modal-section">
+      <div class="modal-section-title" style="color:#1565c0">🔧 OT Preventiva Abierta</div>
+      <div style="display:flex;flex-direction:column;gap:4px;padding:8px;background:#e3f2fd;border-radius:4px;border-left:4px solid #1565c0">
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div><span style="font-size:9px;color:#666;text-transform:uppercase">N° Orden</span><div style="font-size:13px;font-weight:700;color:#1565c0">${OT_PREVENTIVA[m.cod].otId}</div></div>
+          <div><span style="font-size:9px;color:#666;text-transform:uppercase">Estado</span><div style="font-size:13px;font-weight:700;color:#1565c0">${OT_PREVENTIVA[m.cod].estado}</div></div>
+          <div><span style="font-size:9px;color:#666;text-transform:uppercase">Fecha creación</span><div style="font-size:13px;font-weight:700;color:#1565c0">${OT_PREVENTIVA[m.cod].fecha}</div></div>
+        </div>
+      </div>
+    </div>` : ''}
     ${m.bloques && m.bloques.length > 0 ? `
     <div class="modal-section">
       <div class="modal-section-title">Detalle por Componente</div>
