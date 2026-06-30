@@ -94,6 +94,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
 .lr-days.d{color:#fff;background:#cc0000;animation:blink 1.2s infinite;}
 .lr-days.w{color:#9c6500;background:#ffeb9c;}
 .lr-days.s{color:#276221;background:#c6efce;}
+.lr-days.a{color:#fff;background:#1565c0;font-weight:700;}
 .lr-days.n{color:#aaa;}
 .lr-days.b{color:#888;background:#eee;font-size:9px;}
 @keyframes blink{0%,100%{opacity:1;}50%{opacity:.35;}}
@@ -125,6 +126,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
 .g-dot.soon{background:#d4a800;border-color:#ffe566;}
 .g-dot.good{background:#1F7145;border-color:#7ed6a0;}
 .g-dot.nodate{background:#90a4ae;border-color:#cfd8dc;}
+.g-dot.atendida{background:#1565c0;border-color:#90caf9;}
 .g-dot.baja{background:#999;border-color:#ccc;opacity:0.7;}
 @keyframes dot-pulse{0%,100%{box-shadow:0 0 0 0 rgba(204,0,0,.5);}50%{box-shadow:0 0 0 5px rgba(204,0,0,0);}}
 
@@ -263,6 +265,7 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
     <div class="leg"><div class="leg-dot" style="background:#d4a800"></div>Próximo ≤30d</div>
     <div class="leg"><div class="leg-dot" style="background:#1F7145"></div>Al día</div>
     <div class="leg"><div class="leg-dot" style="background:#90a4ae"></div>Sin fecha</div>
+    <div class="leg"><div class="leg-dot" style="background:#1565c0"></div>🔧 Atendida (OT)</div>
     <div class="leg"><div class="leg-dot" style="background:#ff8c42"></div>⚙ Otros Crit.</div>
     <div class="leg" style="background:#fff3f3;border:1px solid #ffcccc;padding:2px 4px 2px 8px;border-radius:10px;display:none;gap:6px;align-items:center" id="leg-alarm-badge">
       🔕 Sin reporte: <b id="leg-alarm-cnt" style="color:#cc0000">0</b>
@@ -402,6 +405,7 @@ function getUsoDiario(tipo, kmhr) {
 let MACHINES = [];
 let DB_MAQUINAS = [];
 let RATE_LOOKUP = {}; // { 'C-02': { last_report: '...', last_fuel: '...' } }
+let OT_PREVENTIVA = {}; // { 'CM-01': {otId, estado} } — OTs preventivas abiertas
 let _db2Loaded = false;
 let _sortByUrgency = false;
 let PAUTAS_DB = [];  // [{tipo,marca,modelo,sheetName,filtros,lubricantes,actividades}]
@@ -547,6 +551,47 @@ function buildRateLookup(wb) {
     }
   }
 
+  return lookup;
+}
+
+// ═══════════════════════════════════════════════════
+// OT PREVENTIVAS ABIERTAS
+// ═══════════════════════════════════════════════════
+function buildOTLookup(wb) {
+  const lookup = {};
+  const wsOT = wb.Sheets['OT'];
+  const wsMaq = wb.Sheets['MAQUINAS'];
+  if (!wsOT || !wsMaq) return lookup;
+
+  // 1. Mapear ID_MAQUINA → código (ej: "m000008" → "CM-01")
+  const idToCod = {};
+  const maqRows = XLSX.utils.sheet_to_json(wsMaq, {header:1, defval:null});
+  for (let i = 1; i < maqRows.length; i++) {
+    const r = maqRows[i]; if (!r) continue;
+    const mid = String(r[0]||'').trim();
+    const codFull = String(r[1]||'').trim(); // "CM-01 YZ6869"
+    if (!mid || !codFull) continue;
+    const cod = codFull.split(/\s+/)[0].toUpperCase(); // "CM-01"
+    idToCod[mid] = cod;
+  }
+
+  // 2. Buscar OT preventivas con estado Trabajando o En espera
+  const otRows = XLSX.utils.sheet_to_json(wsOT, {header:1, defval:null});
+  for (let i = 1; i < otRows.length; i++) {
+    const r = otRows[i]; if (!r) continue;
+    const tipo = String(r[5]||'').trim();     // TIPO_ORDEN (col 5)
+    const estado = String(r[49]||'').trim();  // Estado_Orden (col 49)
+    const mid = String(r[1]||'').trim();      // ID_MAQUINA (col 1)
+    const otId = String(r[0]||'').trim();     // ID_ORDEN (col 0)
+
+    if (/preventivo/i.test(tipo) && /trabajando|en espera/i.test(estado)) {
+      const cod = idToCod[mid];
+      if (cod) {
+        lookup[cod] = { otId, estado, tipo };
+        console.log(`[OT] Preventiva abierta: ${cod} → ${otId} (${estado})`);
+      }
+    }
+  }
   return lookup;
 }
 
@@ -1277,6 +1322,10 @@ function renderRows(list) {
       }
     } else if (isDisc) { faltanStr = 'BAJA'; faltanCls = 'b'; }
 
+    // OT Preventiva abierta → visual "Atendida" en azul (no afecta lógica de urgencia)
+    const tieneOT = !isDisc && OT_PREVENTIVA[m.cod];
+    if (tieneOT) { faltanStr = '🔧 ATENDIDA'; faltanCls = 'a'; }
+
     const propLabel = m.propietario && !m.esDisc ? m.propietario : (m.estado || '—');
 
     // LEFT ROW
@@ -1284,9 +1333,9 @@ function renderRows(list) {
     const codColor = isDisc ? '#888' : (ac==='danger' ? '#cc0000' : ac==='soon' ? '#d4a800' : '#1F7145');
     const stateIco = (!isDisc && ac==='danger') ? '🚨 ' : '';
 
-    // Alarma último reporte — 🔕 si no reportó en 2+ días
+    // Alarma último reporte — 🔕 si no reportó en 2+ días (excluir camionetas)
     let alarmHtml = '';
-    if (_db2Loaded && !isDisc && m.last_report) {
+    if (_db2Loaded && !isDisc && m.last_report && !/camioneta/i.test(m.tipo||'')) {
       const diffDias = (today.getTime() - new Date(m.last_report).getTime()) / 86400000;
       if (diffDias >= 2) {
         const d = Math.floor(diffDias);
@@ -1294,9 +1343,9 @@ function renderRows(list) {
       }
     }
 
-    // Alarma combustible — ⛽ si sin reporte 2+ días y tiene registro de carga
+    // Alarma combustible — ⛽ si sin reporte 2+ días y tiene registro de carga (excluir camionetas)
     let fuelAlarmHtml = '';
-    if (!isDisc && m.last_fuel && m.last_report) {
+    if (!isDisc && m.last_fuel && m.last_report && !/camioneta/i.test(m.tipo||'')) {
       const diffReport = (today.getTime() - new Date(m.last_report).getTime()) / 86400000;
       if (diffReport >= 2) {
         const fuelStr = new Date(m.last_fuel).toLocaleDateString('es-CL');
@@ -1354,7 +1403,7 @@ function renderRows(list) {
       const dOffset = Math.round((dotDate - ganttStartDate) / 86400000);
       if (dOffset >= 0 && dOffset < TOTAL_DAYS) {
         const left = dOffset * DAY_W + DAY_W/2;
-        const dotCls = isDisc ? 'baja' : ac;
+        const dotCls = isDisc ? 'baja' : (tieneOT ? 'atendida' : ac);
         dotHtml = `<div class="g-dot ${dotCls}" style="left:${left}px"
           onmouseenter="showTip(event,${i})" onmouseleave="hideTip()" onclick="openMdet(${i}, event)"></div>`;
       }
@@ -1363,7 +1412,7 @@ function renderRows(list) {
       const todayOff = Math.round((today - ganttStartDate) / 86400000);
       if (todayOff >= 0 && todayOff < TOTAL_DAYS) {
         const left = todayOff * DAY_W + DAY_W/2;
-        const dotCls = isDisc ? 'baja' : (ac === 'nodate' ? 'nodate' : ac);
+        const dotCls = isDisc ? 'baja' : (tieneOT ? 'atendida' : (ac === 'nodate' ? 'nodate' : ac));
         dotHtml = `<div class="g-dot ${dotCls}" style="left:${left}px"
           onmouseenter="showTip(event,${i})" onmouseleave="hideTip()" onclick="openMdet(${i}, event)"></div>`;
       }
@@ -1517,6 +1566,7 @@ function showTip(e, idx) {
     <div class="tip-row"><span>Estado</span><span>${m.estado}</span></div>
     <div class="tip-row"><span>Actual</span><span>${m.hr_act||m.km_act||m.actual||'—'} ${m.kmhr}</span></div>
     <div class="tip-row"><span>Próximo mantenimiento</span><span>${fStr}</span></div>
+    ${OT_PREVENTIVA[m.cod] ? `<div style="margin-top:4px;padding:3px 6px;background:#1565c0;color:#fff;border-radius:3px;font-size:10px;font-weight:700">🔧 OT Preventiva: ${OT_PREVENTIVA[m.cod].estado} (${OT_PREVENTIVA[m.cod].otId})</div>` : ''}
     ${m.otrosCriticos && m.otrosCriticos.length > 0 ? `<div style="margin-top:4px;padding-top:4px;border-top:1px solid #444"><span style="color:#ff6b6b;font-size:10px;font-weight:700">⚠ Otros críticos:</span>${m.otrosCriticos.map(b=>`<div style="color:#ffaa88;font-size:10px;margin-left:6px">· ${b.seccion}: ${Math.round(b.faltan).toLocaleString('es-CL')} ${m.kmhr||''}</div>`).join('')}</div>` : ''}`;
   tip.style.display = 'block';
   moveTip(e);
@@ -1916,6 +1966,7 @@ async function loadData() {
     setLoading(65, 'Procesando datos...');
     DB_MAQUINAS = parseMaquinas(wbMaq);
     RATE_LOOKUP = buildRateLookup(wbMaq);
+    OT_PREVENTIVA = buildOTLookup(wbMaq);
     _db2Loaded = true;
     const maintList = parseMantencion(wbMaint);
     setLoading(80, 'Cruzando información...');
