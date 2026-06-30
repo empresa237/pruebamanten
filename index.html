@@ -257,7 +257,9 @@ body{font-family:Calibri,'Segoe UI',Arial,sans-serif;font-size:11px;background:#
     <option value="panne">🔴 En PANNE</option>
     <option value="soon">🟡 Próximo</option>
     <option value="ok">🟢 Al día</option>
+    <option value="atendida">🔧 Atendida (OT)</option>
     <option value="criticos">⚙ Otros Críticos</option>
+    <option value="atendida">🔧 Atendida (OT)</option>
   </select>
   <div class="tb-sep"></div>
   <div class="legend">
@@ -1148,41 +1150,48 @@ function estimarFechaProxima(m) {
 }
 
 function calcFaltan(m) {
+  // Cache: resultado se guarda en m._cf (se limpia al recargar MACHINES)
+  if (m._cf) return m._cf;
+  let result;
   // Prioridad 1: KM/HR que faltan → calcular fecha estimada
   if (m.faltan !== null) {
     const fechaEst = estimarFechaProxima(m);
     if (fechaEst) {
       const diff = Math.round((fechaEst - today) / 86400000);
-      return { val: diff, tipo: 'días', isDate: true, date: fechaEst, esEstimada: true,
+      result = { val: diff, tipo: 'días', isDate: true, date: fechaEst, esEstimada: true,
                faltanKmHr: m.faltan, unidad: m.kmhr };
+    } else {
+      result = { val: m.faltan, tipo: m.kmhr||'', isDate: false };
     }
-    // Si no se pudo calcular fecha, mostrar KM/HR directamente
-    return { val: m.faltan, tipo: m.kmhr||'', isDate: false };
   }
   // Prioridad 2: fecha de vencimiento de documento
-  if (m.proxDocDate) {
+  else if (m.proxDocDate) {
     const diff = Math.round((m.proxDocDate - today) / 86400000);
-    return { val: diff, tipo: 'días', isDate: true, date: m.proxDocDate, esEstimada: false };
+    result = { val: diff, tipo: 'días', isDate: true, date: m.proxDocDate, esEstimada: false };
   }
-  return { val: null, tipo: '', isDate: false };
+  else { result = { val: null, tipo: '', isDate: false }; }
+  m._cf = result;
+  return result;
 }
 
 function getAlertClass(m) {
-  if (m.estado === 'DESCONTINUADA') return 'baja';
-  // PANNE solo si la planilla indica valor negativo directo (no por estimación)
-  if (m.faltan !== null && m.faltan < 0) return 'danger';
-  const f = calcFaltan(m);
-  if (f.val === null) return 'nodate';
-  if (f.isDate) {
-    // Estimación pasó pero planilla no es negativa → "soon", nunca danger
-    if (f.val <= CONFIG.WARN_DAYS) return 'soon';
-    return 'good';
-  } else {
-    const isKm = /km/i.test(m.kmhr);
-    const warn = isKm ? 3000 : 100;
-    if (f.val <= warn) return 'soon';
-    return 'good';
+  if (m._ac) return m._ac;
+  let ac;
+  if (m.estado === 'DESCONTINUADA') ac = 'baja';
+  else if (m.faltan !== null && m.faltan < 0) ac = 'danger';
+  else {
+    const f = calcFaltan(m);
+    if (f.val === null) ac = 'nodate';
+    else if (f.isDate) {
+      ac = f.val <= CONFIG.WARN_DAYS ? 'soon' : 'good';
+    } else {
+      const isKm = /km/i.test(m.kmhr);
+      const warn = isKm ? 3000 : 100;
+      ac = f.val <= warn ? 'soon' : 'good';
+    }
   }
+  m._ac = ac;
+  return ac;
 }
 
 // ═══════════════════════════════════════════════════
@@ -1206,6 +1215,8 @@ function getFiltered() {
       if (alerta === 'soon' && ac !== 'soon') return false;
       if (alerta === 'ok' && ac !== 'good') return false;
       if (alerta === 'criticos' && (!m.otrosCriticos || m.otrosCriticos.length === 0)) return false;
+      if (alerta === 'atendida' && !OT_PREVENTIVA[m.cod]) return false;
+      if (alerta === 'atendida' && !OT_PREVENTIVA[m.cod]) return false;
     }
     if (q) {
       const txt = [m.cod, m.tipo, m.marca, m.modelo, m.pat, m.familia, m.propietario].join(' ').toLowerCase();
@@ -1502,13 +1513,19 @@ function render() {
 // ═══════════════════════════════════════════════════
 function renderKpis() {
   const active = MACHINES.filter(m => m.estado !== 'DESCONTINUADA');
-  const panne = active.filter(m => getAlertClass(m) === 'danger').length;
-  const soon = active.filter(m => getAlertClass(m) === 'soon').length;
-  const ok = active.filter(m => getAlertClass(m) === 'good').length;
-  const criticos = active.filter(m => m.otrosCriticos && m.otrosCriticos.length > 0).length;
-  // Sin reporte count
+  // Contar una sola vez (optimización: 1 iteración en vez de 4)
+  let panne = 0, soon = 0, ok = 0, criticos = 0, atendidas = 0;
+  active.forEach(m => {
+    const ac = getAlertClass(m);
+    if (ac === 'danger') panne++;
+    else if (ac === 'soon') soon++;
+    else if (ac === 'good') ok++;
+    if (m.otrosCriticos && m.otrosCriticos.length > 0) criticos++;
+    if (OT_PREVENTIVA[m.cod]) atendidas++;
+  });
+  // Sin reporte count (excluye camionetas)
   const sinRep = _db2Loaded
-    ? MACHINES.filter(m => m.estado!=='DESCONTINUADA' && m.last_report &&
+    ? MACHINES.filter(m => m.estado!=='DESCONTINUADA' && !/camioneta/i.test(m.tipo||'') && m.last_report &&
         (today.getTime()-new Date(m.last_report).getTime())/86400000 >= 2).length
     : 0;
 
@@ -1516,6 +1533,7 @@ function renderKpis() {
     <div class="rkpi r"><div class="rkpi-v">${panne}</div><div class="rkpi-l">En PANNE</div></div>
     <div class="rkpi o"><div class="rkpi-v">${soon}</div><div class="rkpi-l">Próximos</div></div>
     <div class="rkpi g"><div class="rkpi-v">${ok}</div><div class="rkpi-l">Al día</div></div>
+    ${atendidas > 0 ? `<div class="rkpi" style="border-left:1px solid rgba(255,255,255,0.15)"><div class="rkpi-v" style="color:#64b5f6">🔧 ${atendidas}</div><div class="rkpi-l">Atendidas</div></div>` : ''}
     ${criticos > 0 ? `<div class="rkpi" style="border-left:1px solid rgba(255,255,255,0.15)"><div class="rkpi-v" style="color:#ff8c42">⚙ ${criticos}</div><div class="rkpi-l">Otros Crit.</div></div>` : ''}
     <div class="rkpi"><div class="rkpi-v">${active.length}</div><div class="rkpi-l">Activos</div></div>`;
 
